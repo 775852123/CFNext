@@ -968,34 +968,53 @@ async function openOutbound(parsed, cfg, colo, isVless) {
     return null;
   };
 
-  // 1) 优先直连目标（非 CF 网站直连可用；CF 网站回环保护会失败）
-  const directResult = await tryConnect({ hostname: parsed.addr, port: parsed.port });
-  if (directResult) return directResult;
+  const target = { hostname: parsed.addr, port: parsed.port };
+  const allowRelay = mode !== 'no';   // outboundMode='no'：禁用反代，仅直连/出站代理
 
-  // 2) 用户自定义 proxyIP 透明代理（优先于内置反代）
-  const relay = cfg.proxyIP ? parseHostPort(cfg.proxyIP, 443) : null;
-  if (relay && relay.host) {
-    let customTargets = await resolveProxyIPs(relay.host, relay.port);
-    if (!customTargets.length) customTargets = [{ hostname: relay.host, port: relay.port }];
-    for (const target of customTargets) {
-      const r = await tryConnect(target);
-      if (r) return r;
-    }
+  // 1) 出站代理强制模式（outboundMode='only'）：仅走 SOCKS5/HTTP 出站，不经反代
+  if (mode === 'only') {
+    const r = await tryConnect(target);
+    if (r) return r;
+    throw lastErr || new Error('所有出站方式均失败');
   }
 
-  // 3) 兜底内置地区反代（透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标）
-  if (isVless) {
-    const relayRegion = selectRelayRegion(colo);
-    const relayDomain = RELAY_DOMAINS[relayRegion];
-    if (relayDomain) {
-      const relayTargets = await resolveProxyIPs(relayDomain, 443);
-      for (const target of relayTargets) {
-        const r = await tryConnect(target);
+  // 2) 已配置出站代理（SOCKS5/HTTP）且未禁用：优先用户自有出口（自建落地 IP 不受流媒体限速）
+  if (viaProxy && allowRelay) {
+    const r = await tryConnect(target);
+    if (r) return r;
+  }
+
+  // 3) 用户自定义 proxyIP 透明反代（显式配置优先于内置反代）
+  if (allowRelay) {
+    const relay = cfg.proxyIP ? parseHostPort(cfg.proxyIP, 443) : null;
+    if (relay && relay.host) {
+      let customTargets = await resolveProxyIPs(relay.host, relay.port);
+      if (!customTargets.length) customTargets = [{ hostname: relay.host, port: relay.port }];
+      for (const t of customTargets) {
+        const r = await tryConnect(t);
         if (r) return r;
       }
     }
   }
 
+  // 4) 内置地区反代（默认启用，优先于直连）：出口为反代落地 IP 而非 CF 数据中心 IP，
+  //    避免 YouTube/Netflix 等流媒体对数据中心 IP 限速（开始快、随后被限到几百 KB/s），
+  //    同时可访问 CF CDN 网站（直连会触发 Cloudflare 回环保护）
+  if (allowRelay && isVless) {
+    const relayRegion = selectRelayRegion(colo);
+    const relayDomain = RELAY_DOMAINS[relayRegion];
+    if (relayDomain) {
+      const relayTargets = await resolveProxyIPs(relayDomain, 443);
+      for (const t of relayTargets) {
+        const r = await tryConnect(t);
+        if (r) return r;
+      }
+    }
+  }
+
+  // 5) 直连兜底（透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标）
+  const r = await tryConnect(target);
+  if (r) return r;
   throw lastErr || new Error('所有出站方式均失败');
 }
 
@@ -1941,8 +1960,8 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo) {
   // 轮询机制关闭：不限制 Clash 300 / V2rayN 800 上限，一次性下发全部节点（数量由数据源与 fillCount 决定）
   if (cfg.polling === false) cap = 10000;
   // 节点数量控制：开启后按设定数量精确下发（输入多少就下发多少，上限 1000 防滥用；默认关闭不限制，不改变其它任何功能）
-  // 轮询机制关闭时忽略数量限制（下发全部节点）
-  if (cfg.nodeLimit && cfg.polling !== false) {
+  // 节点数量控制优先于轮询关闭的“全部下发”——只要开启即按设定数量截断，与轮询开关无关
+  if (cfg.nodeLimit) {
     const n = parseInt(cfg.nodeLimitCount) || 0;
     if (n > 0) cap = Math.min(n, 1000);
   }
@@ -1960,7 +1979,7 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo) {
   }
   // 节点数量控制：订阅模式关闭（默认）时「有多少发多少」，数据源不足不强制补足；
   // 仅自定义订阅模式按设定数量补足（该模式按地区源解析，数量不足时用优选IP补齐）
-  if (cfg.nodeLimit && cfg.polling !== false && mode && nodes.length < cap) {
+  if (cfg.nodeLimit && mode && nodes.length < cap) {
     // 随机补足上限：默认模式最多占 cap 的 20%（随机 IP 质量无保证，仅最后兜底）；
     // 自定义模式保持原补足行为（用户设定数量优先，解析不足时补齐到设定值）
     const quota = (mode === 'custom') ? (cap - nodes.length) : Math.max(0, Math.ceil(cap * 0.2));
