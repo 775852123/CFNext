@@ -41,7 +41,8 @@
 //    D / PATH     自定义面板路径（可选）
 //    ADMIN        面板管理密码（可选，设置后访问面板需登录）
 //    HOST         自定义 SNI/Host（可选，默认使用 Worker 域名）
-//    PROXYIP      自定义反代/落地 IP（可选，留空使用内置地区反代，格式 host 或 host:port）
+//    PROXYIP      自定义反代/落地 IP（可选，留空使用内置地区反代，格式 host 或 host:port；
+//                 支持多条：逗号或换行分隔，Worker 连接时并发拨号、失败自动切换并记忆可用性）
 //    S / OUTBOUND 出站代理（可选，socks5:// / http:// 或 host:port）
 //    ECH          设为 true/1 开启 ECH 加密（可选）
 //    TROJAN       设为 true/1 开启 Trojan 协议（可选）
@@ -232,7 +233,8 @@ const DEFAULT_CONFIG = {
   nodeLimitCount: 100,  // 开启节点数量控制后，最多下发的节点数
   polling: true,        // 轮询机制：开启后每次更新订阅轮询下发新节点（KV issued 去重 + 数量限制），关闭后忽略轮询与限制、下发全部节点
   // 落地与出站
-  proxyIP: '',
+  proxyIP: '',        // 反代/落地 IP（兼容单条，格式 host 或 host:port）
+  proxyIPs: [],       // 反代/落地 IP 池（多条，host 或 host:port，每项 {host, port}）
   outboundProxy: '',
   outboundMode: '',    // '' | 'no' | 'only'
   // 优选节点（保存后随订阅下发到客户端）
@@ -522,6 +524,29 @@ function parseProxyAddress(addr) {
   return { type, host, port, user, pass };
 }
 
+// 解析反代/落地 IP 池：支持数组或字符串（逗号/换行/分号分隔多条，条目格式 host 或 host:port，IPv6 用 [addr]）
+function parseRelayList(input) {
+  const out = [];
+  const seen = new Set();
+  const add = (host, port) => {
+    if (!host) return;
+    const k = host + ':' + port;
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push({ host, port });
+  };
+  const items = Array.isArray(input) ? input : String(input || '').split(/[\n,;]+/);
+  for (const it of items) {
+    if (!it) continue;
+    if (typeof it === 'object' && it.host) { add(it.host, it.port || 443); continue; }
+    const s = String(it).trim();
+    if (!s || s.includes('://')) continue;   // 出站代理格式（socks5:// 等）不属于落地池
+    const { host, port } = parseHostPort(s, 443);
+    add(host, port);
+  }
+  return out;
+}
+
 function json(obj, status) {
   return new Response(JSON.stringify(obj), { status: status || 200, headers: { 'Content-Type': 'application/json; charset=utf-8' } });
 }
@@ -536,7 +561,7 @@ async function loadConfig(env) {
   if (env.D || env.PATH) cfg.path = String(env.D || env.PATH);
   if (env.ADMIN || env.admin) cfg.admin = String(env.ADMIN || env.admin);
   if (env.HOST) cfg.host = String(env.HOST).replace(/^https?:\/\//, '').split('/')[0];
-  if (env.PROXYIP) cfg.proxyIP = String(env.PROXYIP);
+  if (env.PROXYIP) cfg.proxyIPs = parseRelayList(String(env.PROXYIP));
   if (env.S || env.OUTBOUND) cfg.outboundProxy = String(env.S || env.OUTBOUND);
   if (env.ECH === 'true' || env.ECH === '1') cfg.ech = true;
   if (env.TROJAN === 'true' || env.TROJAN === '1') cfg.enableTrojan = true;
@@ -566,6 +591,10 @@ async function loadConfig(env) {
   if (!isUUID(cfg.uuid)) cfg.uuid = uuidv4();
   if (!cfg.path) cfg.path = cfg.uuid;
   if (!Array.isArray(cfg.preferredIPs)) cfg.preferredIPs = parseIPList(cfg.preferredIPs);
+  // 多落地兼容：proxyIPs 数组优先，其次 proxyIP 单条字符串（逗号/换行分隔多条也接受）
+  const rel = parseRelayList(cfg.proxyIPs && cfg.proxyIPs.length ? cfg.proxyIPs : cfg.proxyIP);
+  cfg.proxyIPs = rel;
+  cfg.proxyIP = rel.length ? (rel[0].host + (rel[0].port !== 443 ? ':' + rel[0].port : '')) : '';
   return cfg;
 }
 
@@ -936,7 +965,126 @@ async function resolveProxyIPs(host, port) {
   return result;
 }
 
-// 打开到目标的出站连接（含内置地区反代 / 自定义反代透明代理 / 出站代理 / 直连）
+// ---------------------------------------------------------------------------
+// 落地反代池：多 PROXYIP 并发拨号 + 连接超时 + 可用性记忆
+// ---------------------------------------------------------------------------
+const RELAY_RACE = 3;                  // 每轮并发拨号的落地候选数
+const RELAY_CONNECT_TIMEOUT = 3500;    // 单个落地 TCP 连接超时（毫秒），超时即切换下一个
+const RELAY_DEAD_TTL = 60 * 1000;      // 失败落地 TTL：期间直接跳过，避免重复踩坑
+const RELAY_GOOD_TTL = 5 * 60 * 1000;  // 成功落地 TTL：期间排在最前优先使用
+
+// 落地可用性记忆：key "host:port" → {ok, t}
+const _relayState = new Map();
+function _relayRank(host, port) {
+  const st = _relayState.get(host + ':' + port);
+  if (!st) return 0;
+  if (Date.now() - st.t > RELAY_GOOD_TTL) return 0;
+  return st.ok ? 1 : -1;
+}
+function _relayMark(host, port, ok) {
+  _relayState.set(host + ':' + port, { ok, t: Date.now() });
+}
+
+// 带超时的 TCP 连接：超时关闭 socket 并 reject，避免死落地拖垮整条链路
+// （出站反代长时间无响应是客户端真实延迟 -1 的常见元凶之一）
+function connectWithTimeout(target, ms) {
+  return new Promise((resolve, reject) => {
+    let s;
+    try { s = connect({ hostname: target.hostname, port: target.port }); }
+    catch (e) { reject(e); return; }
+    const timer = setTimeout(() => { try { s.close(); } catch (e) {} reject(new Error('relay timeout')); }, ms);
+    Promise.resolve(s.opened).then(
+      () => { clearTimeout(timer); resolve(s); },
+      (e) => { clearTimeout(timer); try { s.close(); } catch (x) {} reject(e); }
+    );
+  });
+}
+
+// 并发拨号落地候选：首个连接成功者胜出（其余关闭），失败者记入健康记忆；全部失败返回 null
+async function raceRelays(candidates) {
+  if (!candidates || !candidates.length) return null;
+  let done = false, winner = null, pending = candidates.length;
+  await new Promise((resolve) => {
+    for (const c of candidates) {
+      connectWithTimeout(c, RELAY_CONNECT_TIMEOUT).then(
+        (s) => {
+          if (done) { try { s.close(); } catch (e) {} }
+          else { done = true; winner = { socket: s, hostname: c.hostname, port: c.port }; _relayMark(c.hostname, c.port, true); resolve(); }
+        },
+        () => {
+          _relayMark(c.hostname, c.port, false);
+          if (--pending === 0) resolve();
+        }
+      );
+    }
+  });
+  return winner;
+}
+
+// 构造最小 TLS ClientHello（仅含 SNI 扩展），用于验证落地是否真实转发数据
+function buildClientHello(host) {
+  const n = new TextEncoder().encode(host);
+  // SNI extension body：server_name_list(2) + type(1) + name_len(2) + name
+  const sni = new Uint8Array(2 + 1 + 2 + n.length);
+  let o = 0;
+  sni[o++] = 0; sni[o++] = 1 + 2 + n.length;
+  sni[o++] = 0;
+  sni[o++] = (n.length >> 8) & 0xff; sni[o++] = n.length & 0xff;
+  sni.set(n, o);
+  // SNI 扩展：type(2) + len(2) + sni
+  const extSni = new Uint8Array(2 + 2 + sni.length);
+  extSni[0] = 0; extSni[1] = 0;
+  extSni[2] = (sni.length >> 8) & 0xff; extSni[3] = sni.length & 0xff;
+  extSni.set(sni, 4);
+  // 扩展总长：len(2) + extSni
+  const extTotal = new Uint8Array(2 + extSni.length);
+  extTotal[0] = (extSni.length >> 8) & 0xff; extTotal[1] = extSni.length & 0xff;
+  extTotal.set(extSni, 2);
+  // handshake body：version(2) + random(32) + sessid(1) + ciphers(2+4) + comp(2) + extTotal
+  const body = new Uint8Array(2 + 32 + 1 + 2 + 4 + 2 + extTotal.length);
+  o = 0;
+  body[o++] = 0x03; body[o++] = 0x03;
+  for (let i = 0; i < 32; i++) body[o++] = (i * 7 + 3) & 0xff;
+  body[o++] = 0;
+  body[o++] = 0; body[o++] = 4;
+  body[o++] = 0x13; body[o++] = 0x01;
+  body[o++] = 0x13; body[o++] = 0x02;
+  body[o++] = 1; body[o++] = 0;
+  body.set(extTotal, o);
+  // handshake：type(1) + len(3) + body
+  const hs = new Uint8Array(4 + body.length);
+  hs[0] = 0x01;
+  hs[1] = (body.length >> 16) & 0xff; hs[2] = (body.length >> 8) & 0xff; hs[3] = body.length & 0xff;
+  hs.set(body, 4);
+  // record：type(1) + ver(2) + len(2) + hs
+  const rec = new Uint8Array(5 + hs.length);
+  rec[0] = 0x16;
+  rec[1] = 0x03; rec[2] = 0x01;
+  rec[3] = (hs.length >> 8) & 0xff; rec[4] = hs.length & 0xff;
+  rec.set(hs, 5);
+  return rec;
+}
+
+// 落地功能性探测：TCP 连接后发送最小 TLS ClientHello（SNI=www.gstatic.com），
+// 收到任何响应字节即判定为真实转发可用——纯 TCP 连通不代表会转发数据（假可用落地会导致客户端全链路 -1）
+async function probeRelayForward(hostname, port, timeoutMs = 3000) {
+  let s;
+  try { s = await connectWithTimeout({ hostname, port }, RELAY_CONNECT_TIMEOUT); }
+  catch (e) { return false; }
+  try {
+    const writer = s.writable.getWriter();
+    await writer.write(buildClientHello('www.gstatic.com'));
+    const reader = s.readable.getReader();
+    const got = await new Promise((resolve) => {
+      const t = setTimeout(() => resolve(null), timeoutMs);
+      reader.read().then((v) => { clearTimeout(t); resolve(v && v.value && v.value.length ? v.value : null); }, () => { clearTimeout(t); resolve(null); });
+    });
+    return !!got;
+  } catch (e) { return false; }
+  finally { try { s.close(); } catch (e) {} }
+}
+
+// 打开到目标的出站连接（含多落地反代池 / 内置地区反代 / 出站代理 / 直连）
 // 所有模式均为透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标
 async function openOutbound(parsed, cfg, colo, isVless) {
   const proxy = parseProxyAddress(cfg.outboundProxy);
@@ -984,35 +1132,69 @@ async function openOutbound(parsed, cfg, colo, isVless) {
     if (r) return r;
   }
 
-  // 3) 用户自定义 proxyIP 透明反代（显式配置优先于内置反代）
+  // 3) 多落地反代池：面板 PROXYIP 列表（多个）+ 内置地区反代兜底
+  //    并发拨号取最快可用落地，失败自动切换并记忆可用性，全部失败才继续往下
   if (allowRelay) {
-    const relay = cfg.proxyIP ? parseHostPort(cfg.proxyIP, 443) : null;
-    if (relay && relay.host) {
-      let customTargets = await resolveProxyIPs(relay.host, relay.port);
-      if (!customTargets.length) customTargets = [{ hostname: relay.host, port: relay.port }];
-      for (const t of customTargets) {
-        const r = await tryConnect(t);
-        if (r) return r;
+    const relays = parseRelayList(cfg.proxyIPs && cfg.proxyIPs.length ? cfg.proxyIPs : cfg.proxyIP);
+    // 3.1) 面板配置的落地池（并行解析域名，最多取 5 条）
+    if (relays.length) {
+      const seen = new Set();
+      const cands = [];
+      const resolved = await Promise.all(relays.slice(0, 5).map(async (r) => {
+        try {
+          const list = await resolveProxyIPs(r.host, r.port);
+          return list.length ? list : [{ hostname: r.host, port: r.port }];
+        } catch (e) { return [{ hostname: r.host, port: r.port }]; }
+      }));
+      for (const list of resolved) {
+        for (const t of list) {
+          if (!t || !t.hostname) continue;
+          const k = t.hostname + ':' + t.port;
+          if (seen.has(k) || _relayRank(t.hostname, t.port) < 0) continue;
+          seen.add(k);
+          cands.push({ hostname: t.hostname, port: t.port });
+        }
+        if (cands.length >= 8) break;
+      }
+      cands.sort((a, b) => _relayRank(b.hostname, b.port) - _relayRank(a.hostname, a.port));
+      const w1 = await raceRelays(cands.slice(0, RELAY_RACE * 2));
+      if (w1) return w1.socket;
+    }
+    // 3.2) 内置地区反代（兜底）：出口为反代落地 IP 而非 CF 数据中心 IP，
+    //      避免 YouTube/Netflix 等流媒体对数据中心 IP 限速（开始快、随后被限到几百 KB/s），
+    //      同时可访问 CF CDN 网站（直连会触发 Cloudflare 回环保护）
+    if (isVless) {
+      const relayRegion = selectRelayRegion(colo);
+      const relayDomain = RELAY_DOMAINS[relayRegion];
+      if (relayDomain) {
+        const seen = new Set();
+        const cands = [];
+        try {
+          const list = await resolveProxyIPs(relayDomain, 443);
+          const base = list.length ? list : [{ hostname: relayDomain, port: 443 }];
+          for (const t of base) {
+            if (!t || !t.hostname) continue;
+            const k = t.hostname + ':' + t.port;
+            if (seen.has(k) || _relayRank(t.hostname, t.port) < 0) continue;
+            seen.add(k);
+            cands.push({ hostname: t.hostname, port: t.port });
+          }
+        } catch (e) { /* 解析失败忽略 */ }
+        cands.sort((a, b) => _relayRank(b.hostname, b.port) - _relayRank(a.hostname, a.port));
+        const w2 = await raceRelays(cands.slice(0, RELAY_RACE * 2));
+        if (w2) return w2.socket;
+      }
+    }
+    // 3.3) 出站代理组合落地：配置了出站代理时，也允许经代理拨号落地（兼容旧行为）
+    if (viaProxy && relays.length) {
+      for (const r of relays.slice(0, 3)) {
+        const s = await tryConnect({ hostname: r.host, port: r.port });
+        if (s) return s;
       }
     }
   }
 
-  // 4) 内置地区反代（默认启用，优先于直连）：出口为反代落地 IP 而非 CF 数据中心 IP，
-  //    避免 YouTube/Netflix 等流媒体对数据中心 IP 限速（开始快、随后被限到几百 KB/s），
-  //    同时可访问 CF CDN 网站（直连会触发 Cloudflare 回环保护）
-  if (allowRelay && isVless) {
-    const relayRegion = selectRelayRegion(colo);
-    const relayDomain = RELAY_DOMAINS[relayRegion];
-    if (relayDomain) {
-      const relayTargets = await resolveProxyIPs(relayDomain, 443);
-      for (const t of relayTargets) {
-        const r = await tryConnect(t);
-        if (r) return r;
-      }
-    }
-  }
-
-  // 5) 直连兜底（透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标）
+  // 4) 直连兜底（透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标）
   const r = await tryConnect(target);
   if (r) return r;
   throw lastErr || new Error('所有出站方式均失败');
@@ -2319,15 +2501,24 @@ code.hl{background:var(--card2);padding:2px 6px;border-radius:5px;font-family:ui
 
   <div class="card">
     <h2>落地与出站</h2>
-    <div class="grid">
-      <div class="field"><label>反代/落地 IP（留空使用内置地区反代，填写后优先，格式 host 或 host:port）</label><input id="f-proxyIP" placeholder="留空使用内置中继"></div>
-      <div class="field"><label>出站代理（可选，socks5:// / http:// 或 host:port）</label><input id="f-outboundProxy" placeholder="socks5://user:pass@1.2.3.4:1080"></div>
+    <div class="field"><label>反代/落地 IP 池（每行一个，留空使用内置地区反代；格式 host 或 host:port）</label>
+      <textarea id="f-proxyIPs" rows="4" placeholder="proxyip.hk.fxxk.dedyn.io&#10;1.2.3.4:443"></textarea>
+      <div class="hint">支持多条落地：连接时并发拨号取最快可用，失败自动切换下一个并记忆可用性，全部失败才回退直连；保存后立即生效</div>
+      <div class="row" style="margin-top:6px">
+        <button class="btn sm" onclick="fillRecommendedProxyIPs()">填入推荐落地池</button>
+        <button class="btn sm" onclick="probeProxyIPs()">检测可用性</button>
+        <button class="btn sm" onclick="clearDeadProxyIPs()">清除不可用</button>
+      </div>
+      <div class="msg" id="piMsg"></div>
     </div>
-    <div class="field"><label>出站方式</label><select id="f-outboundMode">
-      <option value="">默认（优先代理，失败直连）</option>
-      <option value="no">直连优先（no）</option>
-      <option value="only">仅走代理（only）</option>
-    </select></div>
+    <div class="grid">
+      <div class="field"><label>出站代理（可选，socks5:// / http:// 或 host:port）</label><input id="f-outboundProxy" placeholder="socks5://user:pass@1.2.3.4:1080"></div>
+      <div class="field"><label>出站方式</label><select id="f-outboundMode">
+        <option value="">默认（优先代理，失败直连）</option>
+        <option value="no">直连优先（no）</option>
+        <option value="only">仅走代理（only）</option>
+      </select></div>
+    </div>
   </div>
 </div>
 
@@ -2568,7 +2759,10 @@ function fillForm(){
   $('f-enableTrojan').checked = !!CFG.enableTrojan;
   $('f-trojanPassword').value = CFG.trojanPassword || '';
   $('f-enableXhttp').checked = !!CFG.enableXhttp;
-  $('f-proxyIP').value = CFG.proxyIP || '';
+  $('f-proxyIPs').value = (function(){
+    var pis = (CFG.proxyIPs && CFG.proxyIPs.length) ? CFG.proxyIPs : (CFG.proxyIP ? parseRelayText(CFG.proxyIP) : []);
+    return pis.map(function(x){ return x.host + (x.port && x.port !== 443 ? ':' + x.port : ''); }).join('\n');
+  })();
   $('f-outboundProxy').value = CFG.outboundProxy || '';
   $('f-outboundMode').value = CFG.outboundMode || '';
   var o = CFG.optimizer || {};
@@ -2642,7 +2836,8 @@ function collectForm(){
     enableTrojan: $('f-enableTrojan').checked,
     trojanPassword: $('f-trojanPassword').value,
     enableXhttp: $('f-enableXhttp').checked,
-    proxyIP: $('f-proxyIP').value.trim(),
+    proxyIPs: parseRelayText($('f-proxyIPs').value),
+    proxyIP: (function(){ var a = parseRelayText($('f-proxyIPs').value); return a.length ? (a[0].host + (a[0].port !== 443 ? ':' + a[0].port : '')) : ''; })(),
     outboundProxy: $('f-outboundProxy').value.trim(),
     outboundMode: $('f-outboundMode').value,
     preferredDomains: (function(){
@@ -2699,6 +2894,84 @@ function renderPreferred(){
     lines.push((String(x.ip).indexOf(':') >= 0 ? '[' + x.ip + ']' : x.ip) + ':' + (x.port || 443) + (x.name ? ('#' + x.name) : ''));
   });
   $('f-preferred').value = lines.join('\n');
+}
+
+// ---- 落地池（多 PROXYIP） ----
+var lastProbe = null;   // 最近一次「检测可用性」结果：[{host, port, ok, latency}]
+function parseRelayText(t){
+  var out = [], seen = {};
+  String(t || '').split(/[\n,;]+/).map(function(s){ return s.trim(); }).filter(Boolean).forEach(function(s){
+    if (s.indexOf('://') >= 0) return;
+    var m;
+    if ((m = s.match(/^\[([0-9a-fA-F:]+)\](?::(\d+))?$/))) { var k = m[1] + ':' + (parseInt(m[2]) || 443); if (!seen[k]) { seen[k] = 1; out.push({ host: m[1], port: parseInt(m[2]) || 443 }); } return; }
+    var idx = s.lastIndexOf(':');
+    var host = (idx > 0 && /^\d+$/.test(s.slice(idx + 1))) ? s.slice(0, idx) : s;
+    var port = (idx > 0 && /^\d+$/.test(s.slice(idx + 1))) ? parseInt(s.slice(idx + 1)) : 443;
+    var kk = host + ':' + port;
+    if (!seen[kk]) { seen[kk] = 1; out.push({ host: host, port: port }); }
+  });
+  return out;
+}
+// 社区常用落地池（来自 edgetunnel 社区维护列表，2026-09 收集）。
+// 注意：落地由 Worker 在 CF 机房侧拨号，本地家宽无法直接验证；
+// 实际可用性由 Worker 运行期并发拨号自动判定（见 raceRelays），失效自动切换并记忆，也可用下方「检测可用性」按钮实测。
+var RECOMMENDED_PROXYIPS = [
+  'proxyip.hk.fxxk.dedyn.io', 'proxyip.jp.fxxk.dedyn.io', 'proxyip.us.fxxk.dedyn.io',
+  'proxyip.sg.fxxk.dedyn.io', 'proxyip.oracle.fxxk.dedyn.io', 'proxyip.digitalocean.fxxk.dedyn.io',
+  'proxyip.aliyun.fxxk.dedyn.io',
+  'hk.ipdb.rr.nu', 'us.ipdb.rr.nu', 'sg.ipdb.rr.nu', 'jp.ipdb.rr.nu', 'nl.ipdb.rr.nu',
+  'hk.cf.zhetengsha.eu.org', 'sg.cf.zhetengsha.eu.org', 'us.cf.zhetengsha.eu.org', 'jp.cf.zhetengsha.eu.org',
+  'my-telegram-is-herocore.onecf.eu.org', 'workers.cloudflare.cyou'
+];
+function fillRecommendedProxyIPs(){
+  $('f-proxyIPs').value = RECOMMENDED_PROXYIPS.join('\n');
+  markDirty();
+  toast('已填入推荐落地池，点击「保存全部」生效', 'ok');
+}
+function probeProxyIPs(){
+  var list = $('f-proxyIPs').value.trim();
+  if(!list){ showMsg('piMsg', '请先填写要检测的落地地址', 'err'); return; }
+  showMsg('piMsg', '正在从 Worker 检测落地可用性…', 'info');
+  api('proxyip-probe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ list: list }) })
+    .then(function(r){
+      var el = $('piMsg');
+      if(!r || !r.ok){ showMsg('piMsg', (r && r.msg) || '检测失败', 'err'); return; }
+      lastProbe = r.data || [];
+      el.className = 'msg show ok';
+      el.textContent = '';
+      (r.data || []).forEach(function(x){
+        var line = document.createElement('div');
+        line.textContent = x.host + ':' + x.port + ' → ' + (x.ok ? ('可用 ' + x.latency + 'ms') : '不可用');
+        line.style.color = x.ok ? '#3fb950' : '#f85149';
+        el.appendChild(line);
+      });
+      if(!(r.data || []).length) el.textContent = '无可检测项';
+    })
+    .catch(function(){ showMsg('piMsg', '检测失败：无法连接服务器', 'err'); });
+}
+// 从落地列表中剔除最近一次检测判定为不可用的条目（仅移除被检测过且失败的行；未检测/解析异常的行保留）
+function filterDeadProxyIPs(text, probeData){
+  var dead = {};
+  (probeData || []).forEach(function(x){ if(!x.ok) dead[x.host + ':' + x.port] = 1; });
+  var out = [];
+  String(text || '').split(/[\n,;]+/).map(function(s){ return s.trim(); }).filter(Boolean).forEach(function(s){
+    if (s.indexOf('://') >= 0) { out.push(s); return; }
+    var p = parseRelayText(s)[0];
+    if (!p) { out.push(s); return; }
+    if (dead[p.host + ':' + p.port]) return;
+    out.push(s);
+  });
+  return out;
+}
+function clearDeadProxyIPs(){
+  if (!lastProbe || !lastProbe.length) { toast('请先点击「检测可用性」再清除', 'err'); return; }
+  var before = String($('f-proxyIPs').value).split(/[\n,;]+/).map(function(s){ return s.trim(); }).filter(Boolean);
+  var after = filterDeadProxyIPs($('f-proxyIPs').value, lastProbe);
+  var removed = before.length - after.length;
+  if (!removed) { toast('没有不可用条目需要清除', 'err'); return; }
+  $('f-proxyIPs').value = after.join('\n');
+  markDirty();
+  toast('已清除 ' + removed + ' 条不可用落地，点击「保存全部」生效', 'ok');
 }
 
 // ---- 优选器 ----
@@ -3070,6 +3343,30 @@ async function handleRequest(request, env) {
 
     if (apiName === 'status') {
       return json({ ok: true, data: { version: VERSION, host: url.hostname, path: panelPath, region: (request.cf && request.cf.colo) || 'unknown' } });
+    }
+
+    if (apiName === 'proxyip-probe') {
+      if (request.method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);
+      try {
+        const body = await request.json().catch(() => ({}));
+        const relays = parseRelayList(body.list || cfg.proxyIPs);
+        const results = [];
+        const tStart = Date.now();
+        // 真实转发探测：TCP 连接 + TLS ClientHello 等待对端回包，能区分"TCP 通但不转发"的假可用落地
+        await Promise.all(relays.slice(0, 10).map(async (r) => {
+          const t0 = Date.now();
+          let ok = false;
+          try {
+            const list = await resolveProxyIPs(r.host, r.port);
+            const base = list.length ? list.slice(0, 2) : [{ hostname: r.host, port: r.port }];
+            for (const t of base) {
+              if (await probeRelayForward(t.hostname, t.port)) { ok = true; break; }
+            }
+          } catch (e) { /* 不可用 */ }
+          results.push({ host: r.host, port: r.port, ok, latency: Date.now() - t0 });
+        }));
+        return json({ ok: true, data: results, elapsed: Date.now() - tStart });
+      } catch (e) { return json({ ok: false, msg: '检测失败: ' + (e.message || e) }, 500); }
     }
 
     if (apiName === 'sub') {
