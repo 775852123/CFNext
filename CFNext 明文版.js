@@ -41,8 +41,7 @@
 //    D / PATH     自定义面板路径（可选）
 //    ADMIN        面板管理密码（可选，设置后访问面板需登录）
 //    HOST         自定义 SNI/Host（可选，默认使用 Worker 域名）
-//    PROXYIP      自定义反代/落地 IP（可选，留空使用内置地区反代，格式 host 或 host:port；
-//                 支持多条：逗号或换行分隔，Worker 连接时并发拨号、失败自动切换并记忆可用性）
+//    PROXYIP      自定义反代/落地 IP（可选，留空使用内置地区反代，格式 host 或 host:port）
 //    S / OUTBOUND 出站代理（可选，socks5:// / http:// 或 host:port）
 //    ECH          设为 true/1 开启 ECH 加密（可选）
 //    TROJAN       设为 true/1 开启 Trojan 协议（可选）
@@ -233,8 +232,7 @@ const DEFAULT_CONFIG = {
   nodeLimitCount: 100,  // 开启节点数量控制后，最多下发的节点数
   polling: true,        // 轮询机制：开启后每次更新订阅轮询下发新节点（KV issued 去重 + 数量限制），关闭后忽略轮询与限制、下发全部节点
   // 落地与出站
-  proxyIP: '',        // 反代/落地 IP（兼容单条，格式 host 或 host:port）
-  proxyIPs: [],       // 反代/落地 IP 池（多条，host 或 host:port，每项 {host, port}）
+  proxyIP: '',
   outboundProxy: '',
   outboundMode: '',    // '' | 'no' | 'only'
   // 优选节点（保存后随订阅下发到客户端）
@@ -265,17 +263,82 @@ const DEFAULT_CONFIG = {
 const BUILTIN_OFFICIAL_DOMAINS = ['cloudflare.com', 'www.cloudflare.com', 'speed.cloudflare.com'];
 
 // 内置 Cloudflare 优选 IP 池：未配置优选节点时开箱即用的可用节点（部署即下发）
-// 优选IP-33 ~ 37 为本地网络实测 TCP 443 可达的 CF Anycast IP（2026-09 实测 190-230ms），扩大优质节点供给、减少随机占比
 const BUILTIN_PREFERRED_IPS = [
-  '104.17.127.180#优选IP-01', '104.16.123.96#优选IP-02', '104.16.124.96#优选IP-03', '104.16.125.96#优选IP-04',
-  '104.16.126.96#优选IP-05', '104.16.127.96#优选IP-06', '104.16.132.229#优选IP-07', '104.16.248.248#优选IP-08',
-  '104.16.249.249#优选IP-09', '162.159.0.1#优选IP-10', '188.114.96.1#优选IP-11', '104.17.24.252#优选IP-12',
-  '188.114.99.52#优选IP-13', '162.159.94.229#优选IP-14', '162.159.5.175#优选IP-15', '104.18.119.34#优选IP-16',
-  '104.21.213.24#优选IP-17', '104.17.234.5#优选IP-18', '104.16.245.187#优选IP-19', '172.67.64.211#优选IP-20',
-  '172.67.64.12#优选IP-21', '104.18.43.224#优选IP-22', '104.18.40.93#优选IP-23', '104.18.37.92#优选IP-24',
-  '104.18.47.234#优选IP-25', '104.18.42.54#优选IP-26', '172.64.144.49#优选IP-27', '172.64.146.15#优选IP-28',
-  '104.17.185.207#优选IP-29', '104.17.101.139#优选IP-30', '162.159.44.215#优选IP-31', '162.159.44.214#优选IP-32',
-  '104.18.217.109#优选IP-33', '172.65.127.225#优选IP-34', '104.18.184.243#优选IP-35', '162.159.137.205#优选IP-36', '172.65.64.7#优选IP-37'
+  '104.17.127.180#优选IP-001', '104.16.123.96#优选IP-002', '104.16.124.96#优选IP-003', '104.16.125.96#优选IP-004',
+  '104.16.126.96#优选IP-005', '104.16.127.96#优选IP-006', '104.16.132.229#优选IP-007', '104.16.248.248#优选IP-008',
+  '104.16.249.249#优选IP-009', '162.159.0.1#优选IP-010', '188.114.96.1#优选IP-011', '104.17.24.252#优选IP-012',
+  '188.114.99.52#优选IP-013', '162.159.94.229#优选IP-014', '162.159.5.175#优选IP-015', '104.18.119.34#优选IP-016',
+  '104.21.213.24#优选IP-017', '104.17.234.5#优选IP-018', '104.16.245.187#优选IP-019', '172.67.64.211#优选IP-020',
+  '172.67.64.12#优选IP-021', '104.18.43.224#优选IP-022', '104.18.40.93#优选IP-023', '104.18.37.92#优选IP-024',
+  '104.18.47.234#优选IP-025', '104.18.42.54#优选IP-026', '172.64.144.49#优选IP-027', '172.64.146.15#优选IP-028',
+  '104.17.185.207#优选IP-029', '104.17.101.139#优选IP-030', '162.159.44.215#优选IP-031', '162.159.44.214#优选IP-032',
+  '104.18.217.109#优选IP-033', '172.65.127.225#优选IP-034', '104.18.184.243#优选IP-035', '162.159.137.205#优选IP-036',
+  '172.65.64.7#优选IP-037', '104.25.45.44#优选IP-038', '104.19.88.253#优选IP-039', '162.159.136.73#优选IP-040',
+  '104.18.185.40#优选IP-041', '104.25.141.168#优选IP-042', '104.25.246.123#优选IP-043', '104.24.54.254#优选IP-044',
+  '104.19.123.4#优选IP-045', '188.114.98.144#优选IP-046', '188.114.99.18#优选IP-047', '104.17.127.106#优选IP-048',
+  '162.159.4.175#优选IP-049', '104.18.255.187#优选IP-050', '172.65.173.221#优选IP-051', '104.18.176.111#优选IP-052',
+  '104.25.122.6#优选IP-053', '188.114.96.116#优选IP-054', '104.25.214.211#优选IP-055', '104.16.223.195#优选IP-056',
+  '104.25.101.186#优选IP-057', '172.64.81.44#优选IP-058', '104.25.143.238#优选IP-059', '188.114.99.114#优选IP-060',
+  '104.19.169.53#优选IP-061', '104.16.113.211#优选IP-062', '104.27.40.81#优选IP-063', '188.114.98.91#优选IP-064',
+  '162.159.236.5#优选IP-065', '104.25.44.144#优选IP-066', '162.159.46.167#优选IP-067', '104.18.84.180#优选IP-068',
+  '104.18.196.199#优选IP-069', '104.24.155.234#优选IP-070', '162.159.228.244#优选IP-071', '162.159.235.27#优选IP-072',
+  '104.19.214.25#优选IP-073', '104.19.168.107#优选IP-074', '104.24.244.237#优选IP-075', '104.27.66.179#优选IP-076',
+  '104.24.2.253#优选IP-077', '104.21.61.179#优选IP-078', '104.21.114.216#优选IP-079', '188.114.98.53#优选IP-080',
+  '172.65.145.187#优选IP-081', '188.114.96.255#优选IP-082', '104.25.245.147#优选IP-083', '172.66.161.31#优选IP-084',
+  '104.18.133.24#优选IP-085', '188.114.99.155#优选IP-086', '172.64.34.109#优选IP-087', '172.64.145.202#优选IP-088',
+  '104.19.78.30#优选IP-089', '104.17.118.180#优选IP-090', '104.17.13.179#优选IP-091', '172.65.35.169#优选IP-092',
+  '104.16.0.133#优选IP-093', '104.16.238.98#优选IP-094', '104.18.28.140#优选IP-095', '104.19.115.243#优选IP-096',
+  '104.24.58.243#优选IP-097', '104.27.207.36#优选IP-098', '104.21.192.230#优选IP-099', '104.25.20.146#优选IP-100',
+  '104.27.113.151#优选IP-101', '104.24.230.144#优选IP-102', '172.65.134.100#优选IP-103', '188.114.96.94#优选IP-104',
+  '104.25.197.107#优选IP-105', '104.16.108.18#优选IP-106', '172.64.233.36#优选IP-107', '172.67.163.14#优选IP-108',
+  '104.24.230.213#优选IP-109', '104.19.106.1#优选IP-110', '104.27.72.4#优选IP-111', '104.21.57.47#优选IP-112',
+  '172.65.162.213#优选IP-113', '172.67.255.83#优选IP-114', '172.67.189.246#优选IP-115', '162.159.230.149#优选IP-116',
+  '162.159.197.16#优选IP-117', '172.67.103.87#优选IP-118', '162.159.237.243#优选IP-119', '104.25.193.135#优选IP-120',
+  '104.18.141.27#优选IP-121', '172.65.11.191#优选IP-122', '104.24.184.158#优选IP-123', '188.114.97.52#优选IP-124',
+  '104.27.4.144#优选IP-125', '104.25.93.154#优选IP-126', '172.66.199.166#优选IP-127', '172.67.64.94#优选IP-128',
+  '104.27.94.231#优选IP-129', '104.24.168.96#优选IP-130', '104.18.173.224#优选IP-131', '172.67.173.89#优选IP-132',
+  '104.17.107.217#优选IP-133', '188.114.97.91#优选IP-134', '104.17.195.184#优选IP-135', '162.159.14.18#优选IP-136',
+  '172.67.229.44#优选IP-137', '104.24.51.58#优选IP-138', '104.19.97.238#优选IP-139', '104.25.161.217#优选IP-140',
+  '104.17.146.117#优选IP-141', '172.67.161.136#优选IP-142', '104.17.99.0#优选IP-143', '104.25.100.203#优选IP-144',
+  '104.19.23.222#优选IP-145', '188.114.96.141#优选IP-146', '104.19.247.23#优选IP-147', '104.25.24.66#优选IP-148',
+  '104.16.123.26#优选IP-149', '104.27.23.242#优选IP-150', '104.25.36.200#优选IP-151', '104.17.195.133#优选IP-152',
+  '104.16.68.175#优选IP-153', '188.114.98.19#优选IP-154', '104.16.218.231#优选IP-155', '104.18.28.48#优选IP-156',
+  '162.159.143.225#优选IP-157', '162.159.19.201#优选IP-158', '104.25.166.112#优选IP-159', '104.16.201.45#优选IP-160',
+  '104.16.91.33#优选IP-161', '172.67.82.86#优选IP-162', '104.16.11.246#优选IP-163', '188.114.97.61#优选IP-164',
+  '104.17.240.245#优选IP-165', '172.66.157.150#优选IP-166', '104.17.25.173#优选IP-167', '104.18.26.28#优选IP-168',
+  '104.18.123.15#优选IP-169', '104.25.124.155#优选IP-170', '188.114.96.64#优选IP-171', '104.18.18.214#优选IP-172',
+  '104.17.46.187#优选IP-173', '104.17.153.58#优选IP-174', '188.114.96.89#优选IP-175', '172.67.174.143#优选IP-176',
+  '104.25.251.220#优选IP-177', '104.27.195.79#优选IP-178', '162.159.153.10#优选IP-179', '104.25.129.238#优选IP-180',
+  '172.65.3.67#优选IP-181', '172.67.232.109#优选IP-182', '104.18.178.193#优选IP-183', '104.19.78.144#优选IP-184',
+  '104.18.63.107#优选IP-185', '104.19.69.150#优选IP-186', '104.25.73.92#优选IP-187', '172.67.195.152#优选IP-188',
+  '172.65.184.114#优选IP-189', '172.65.202.216#优选IP-190', '172.65.21.190#优选IP-191', '104.19.32.220#优选IP-192',
+  '104.18.211.8#优选IP-193', '104.17.160.131#优选IP-194', '162.159.6.39#优选IP-195', '162.159.43.223#优选IP-196',
+  '104.21.224.5#优选IP-197', '104.25.18.216#优选IP-198', '162.159.6.246#优选IP-199', '104.24.46.127#优选IP-200',
+  '104.17.87.46#优选IP-201', '188.114.97.80#优选IP-202', '188.114.97.108#优选IP-203', '162.159.241.11#优选IP-204',
+  '188.114.97.0#优选IP-205', '188.114.99.14#优选IP-206', '104.19.68.127#优选IP-207', '162.159.10.45#优选IP-208',
+  '104.25.181.74#优选IP-209', '104.24.178.200#优选IP-210', '188.114.96.164#优选IP-211', '104.24.41.240#优选IP-212',
+  '104.17.97.72#优选IP-213', '104.16.77.112#优选IP-214', '104.19.181.118#优选IP-215', '172.67.165.245#优选IP-216',
+  '104.17.169.109#优选IP-217', '172.65.44.103#优选IP-218', '188.114.97.63#优选IP-219', '172.65.47.182#优选IP-220',
+  '104.17.245.237#优选IP-221', '162.159.2.86#优选IP-222', '188.114.96.151#优选IP-223', '172.65.139.108#优选IP-224',
+  '172.65.118.105#优选IP-225', '104.21.7.133#优选IP-226', '162.159.134.174#优选IP-227', '104.18.194.107#优选IP-228',
+  '188.114.97.21#优选IP-229', '162.159.9.18#优选IP-230', '104.18.41.168#优选IP-231', '162.159.192.111#优选IP-232',
+  '162.159.240.54#优选IP-233', '104.17.0.4#优选IP-234', '104.25.86.143#优选IP-235', '104.27.97.130#优选IP-236',
+  '172.67.127.122#优选IP-237', '104.25.33.126#优选IP-238', '104.25.223.90#优选IP-239', '104.25.123.130#优选IP-240',
+  '172.65.167.52#优选IP-241', '172.67.159.243#优选IP-242', '104.25.113.22#优选IP-243', '188.114.98.27#优选IP-244',
+  '162.159.198.200#优选IP-245', '104.17.76.49#优选IP-246', '104.21.215.255#优选IP-247', '172.67.131.200#优选IP-248',
+  '162.159.135.234#优选IP-249', '172.65.45.102#优选IP-250', '172.66.164.60#优选IP-251', '162.159.26.248#优选IP-252',
+  '162.159.90.82#优选IP-253', '172.65.50.167#优选IP-254', '162.159.236.19#优选IP-255', '104.19.143.220#优选IP-256',
+  '104.17.151.244#优选IP-257', '104.17.121.245#优选IP-258', '104.18.144.168#优选IP-259', '162.159.228.231#优选IP-260',
+  '104.17.100.40#优选IP-261', '104.27.116.114#优选IP-262', '162.159.199.220#优选IP-263', '104.20.17.160#优选IP-264',
+  '104.25.62.39#优选IP-265', '104.27.20.220#优选IP-266', '172.65.118.85#优选IP-267', '104.19.83.33#优选IP-268',
+  '188.114.96.238#优选IP-269', '162.159.42.67#优选IP-270', '104.27.46.114#优选IP-271', '104.25.126.144#优选IP-272',
+  '104.25.173.14#优选IP-273', '104.24.46.107#优选IP-274', '104.25.109.0#优选IP-275', '162.159.137.71#优选IP-276',
+  '104.25.238.28#优选IP-277', '104.27.124.239#优选IP-278', '104.24.34.149#优选IP-279', '104.19.246.234#优选IP-280',
+  '162.159.10.243#优选IP-281', '104.27.96.232#优选IP-282', '172.65.78.200#优选IP-283', '104.24.25.178#优选IP-284',
+  '104.24.84.86#优选IP-285', '104.25.238.237#优选IP-286', '104.16.45.249#优选IP-287', '104.16.234.241#优选IP-288',
+  '104.24.18.62#优选IP-289', '172.65.45.248#优选IP-290', '104.25.169.144#优选IP-291', '104.27.27.106#优选IP-292',
+  '162.159.43.85#优选IP-293', '172.67.71.106#优选IP-294', '162.159.228.164#优选IP-295', '104.24.250.89#优选IP-296',
+  '104.18.185.26#优选IP-297', '104.27.21.175#优选IP-298', '104.24.49.39#优选IP-299', '172.67.85.54#优选IP-300',
 ];
 
 // 内置默认优选池：未配置任何优选时自动 DoH 解析下发真实优选节点（而非 CF 随机补足）
@@ -458,37 +521,6 @@ function randomIPsFromCidrs(cidrs, count) {
   return out;
 }
 
-// 随机生成 IP 下发前 TCP 443 可达性探测：并发 connect，剔除完全不可达的 IP。
-// 说明：Worker 端探测只能过滤"CF 段内未激活/已弃用的死 IP"（用户本地链路的延迟差异测不出），
-// 因此随机生成占比已限制在 cap 的 20% 以内，探测只是最后一道保险。
-// 探测不可用（connect 抛错，如测试 stub / 本地环境）时原样返回，不误删节点。
-async function probeReachable(ips, timeout = 800, concurrency = 16) {
-  if (!ips || !ips.length) return [];
-  const ok = [];
-  const q = [...ips];
-  let probeBroken = false;
-  const ws = [];
-  for (let i = 0; i < concurrency && i < q.length; i++) ws.push((async () => {
-    while (q.length) {
-      const ip = q.shift();
-      try {
-        await new Promise((res, rej) => {
-          let s;
-          try { s = connect({ hostname: ip, port: 443 }); } catch (e) { probeBroken = true; rej(e); return; }
-          const t = setTimeout(() => { try { s.close(); } catch (e) {} rej(new Error('timeout')); }, timeout);
-          Promise.resolve(s.opened).then(
-            () => { clearTimeout(t); try { s.close(); } catch (e) {} res(); },
-            (e) => { clearTimeout(t); try { s.close(); } catch (e) {} rej(e); }
-          );
-        });
-        ok.push(ip);
-      } catch (e) { /* 不可达，剔除 */ }
-    }
-  })());
-  await Promise.all(ws);
-  return probeBroken ? [...ips] : ok;
-}
-
 // 解析 "1.2.3.4:443#名称, 5.6.7.8" 这类优选列表（仅接受合法 IP 行，过滤 HTML 等杂质）
 function parseIPList(text) {
   const items = [];
@@ -524,29 +556,6 @@ function parseProxyAddress(addr) {
   return { type, host, port, user, pass };
 }
 
-// 解析反代/落地 IP 池：支持数组或字符串（逗号/换行/分号分隔多条，条目格式 host 或 host:port，IPv6 用 [addr]）
-function parseRelayList(input) {
-  const out = [];
-  const seen = new Set();
-  const add = (host, port) => {
-    if (!host) return;
-    const k = host + ':' + port;
-    if (seen.has(k)) return;
-    seen.add(k);
-    out.push({ host, port });
-  };
-  const items = Array.isArray(input) ? input : String(input || '').split(/[\n,;]+/);
-  for (const it of items) {
-    if (!it) continue;
-    if (typeof it === 'object' && it.host) { add(it.host, it.port || 443); continue; }
-    const s = String(it).trim();
-    if (!s || s.includes('://')) continue;   // 出站代理格式（socks5:// 等）不属于落地池
-    const { host, port } = parseHostPort(s, 443);
-    add(host, port);
-  }
-  return out;
-}
-
 function json(obj, status) {
   return new Response(JSON.stringify(obj), { status: status || 200, headers: { 'Content-Type': 'application/json; charset=utf-8' } });
 }
@@ -561,7 +570,7 @@ async function loadConfig(env) {
   if (env.D || env.PATH) cfg.path = String(env.D || env.PATH);
   if (env.ADMIN || env.admin) cfg.admin = String(env.ADMIN || env.admin);
   if (env.HOST) cfg.host = String(env.HOST).replace(/^https?:\/\//, '').split('/')[0];
-  if (env.PROXYIP) cfg.proxyIPs = parseRelayList(String(env.PROXYIP));
+  if (env.PROXYIP) cfg.proxyIP = String(env.PROXYIP);
   if (env.S || env.OUTBOUND) cfg.outboundProxy = String(env.S || env.OUTBOUND);
   if (env.ECH === 'true' || env.ECH === '1') cfg.ech = true;
   if (env.TROJAN === 'true' || env.TROJAN === '1') cfg.enableTrojan = true;
@@ -591,10 +600,6 @@ async function loadConfig(env) {
   if (!isUUID(cfg.uuid)) cfg.uuid = uuidv4();
   if (!cfg.path) cfg.path = cfg.uuid;
   if (!Array.isArray(cfg.preferredIPs)) cfg.preferredIPs = parseIPList(cfg.preferredIPs);
-  // 多落地兼容：proxyIPs 数组优先，其次 proxyIP 单条字符串（逗号/换行分隔多条也接受）
-  const rel = parseRelayList(cfg.proxyIPs && cfg.proxyIPs.length ? cfg.proxyIPs : cfg.proxyIP);
-  cfg.proxyIPs = rel;
-  cfg.proxyIP = rel.length ? (rel[0].host + (rel[0].port !== 443 ? ':' + rel[0].port : '')) : '';
   return cfg;
 }
 
@@ -965,126 +970,7 @@ async function resolveProxyIPs(host, port) {
   return result;
 }
 
-// ---------------------------------------------------------------------------
-// 落地反代池：多 PROXYIP 并发拨号 + 连接超时 + 可用性记忆
-// ---------------------------------------------------------------------------
-const RELAY_RACE = 3;                  // 每轮并发拨号的落地候选数
-const RELAY_CONNECT_TIMEOUT = 3500;    // 单个落地 TCP 连接超时（毫秒），超时即切换下一个
-const RELAY_DEAD_TTL = 60 * 1000;      // 失败落地 TTL：期间直接跳过，避免重复踩坑
-const RELAY_GOOD_TTL = 5 * 60 * 1000;  // 成功落地 TTL：期间排在最前优先使用
-
-// 落地可用性记忆：key "host:port" → {ok, t}
-const _relayState = new Map();
-function _relayRank(host, port) {
-  const st = _relayState.get(host + ':' + port);
-  if (!st) return 0;
-  if (Date.now() - st.t > RELAY_GOOD_TTL) return 0;
-  return st.ok ? 1 : -1;
-}
-function _relayMark(host, port, ok) {
-  _relayState.set(host + ':' + port, { ok, t: Date.now() });
-}
-
-// 带超时的 TCP 连接：超时关闭 socket 并 reject，避免死落地拖垮整条链路
-// （出站反代长时间无响应是客户端真实延迟 -1 的常见元凶之一）
-function connectWithTimeout(target, ms) {
-  return new Promise((resolve, reject) => {
-    let s;
-    try { s = connect({ hostname: target.hostname, port: target.port }); }
-    catch (e) { reject(e); return; }
-    const timer = setTimeout(() => { try { s.close(); } catch (e) {} reject(new Error('relay timeout')); }, ms);
-    Promise.resolve(s.opened).then(
-      () => { clearTimeout(timer); resolve(s); },
-      (e) => { clearTimeout(timer); try { s.close(); } catch (x) {} reject(e); }
-    );
-  });
-}
-
-// 并发拨号落地候选：首个连接成功者胜出（其余关闭），失败者记入健康记忆；全部失败返回 null
-async function raceRelays(candidates) {
-  if (!candidates || !candidates.length) return null;
-  let done = false, winner = null, pending = candidates.length;
-  await new Promise((resolve) => {
-    for (const c of candidates) {
-      connectWithTimeout(c, RELAY_CONNECT_TIMEOUT).then(
-        (s) => {
-          if (done) { try { s.close(); } catch (e) {} }
-          else { done = true; winner = { socket: s, hostname: c.hostname, port: c.port }; _relayMark(c.hostname, c.port, true); resolve(); }
-        },
-        () => {
-          _relayMark(c.hostname, c.port, false);
-          if (--pending === 0) resolve();
-        }
-      );
-    }
-  });
-  return winner;
-}
-
-// 构造最小 TLS ClientHello（仅含 SNI 扩展），用于验证落地是否真实转发数据
-function buildClientHello(host) {
-  const n = new TextEncoder().encode(host);
-  // SNI extension body：server_name_list(2) + type(1) + name_len(2) + name
-  const sni = new Uint8Array(2 + 1 + 2 + n.length);
-  let o = 0;
-  sni[o++] = 0; sni[o++] = 1 + 2 + n.length;
-  sni[o++] = 0;
-  sni[o++] = (n.length >> 8) & 0xff; sni[o++] = n.length & 0xff;
-  sni.set(n, o);
-  // SNI 扩展：type(2) + len(2) + sni
-  const extSni = new Uint8Array(2 + 2 + sni.length);
-  extSni[0] = 0; extSni[1] = 0;
-  extSni[2] = (sni.length >> 8) & 0xff; extSni[3] = sni.length & 0xff;
-  extSni.set(sni, 4);
-  // 扩展总长：len(2) + extSni
-  const extTotal = new Uint8Array(2 + extSni.length);
-  extTotal[0] = (extSni.length >> 8) & 0xff; extTotal[1] = extSni.length & 0xff;
-  extTotal.set(extSni, 2);
-  // handshake body：version(2) + random(32) + sessid(1) + ciphers(2+4) + comp(2) + extTotal
-  const body = new Uint8Array(2 + 32 + 1 + 2 + 4 + 2 + extTotal.length);
-  o = 0;
-  body[o++] = 0x03; body[o++] = 0x03;
-  for (let i = 0; i < 32; i++) body[o++] = (i * 7 + 3) & 0xff;
-  body[o++] = 0;
-  body[o++] = 0; body[o++] = 4;
-  body[o++] = 0x13; body[o++] = 0x01;
-  body[o++] = 0x13; body[o++] = 0x02;
-  body[o++] = 1; body[o++] = 0;
-  body.set(extTotal, o);
-  // handshake：type(1) + len(3) + body
-  const hs = new Uint8Array(4 + body.length);
-  hs[0] = 0x01;
-  hs[1] = (body.length >> 16) & 0xff; hs[2] = (body.length >> 8) & 0xff; hs[3] = body.length & 0xff;
-  hs.set(body, 4);
-  // record：type(1) + ver(2) + len(2) + hs
-  const rec = new Uint8Array(5 + hs.length);
-  rec[0] = 0x16;
-  rec[1] = 0x03; rec[2] = 0x01;
-  rec[3] = (hs.length >> 8) & 0xff; rec[4] = hs.length & 0xff;
-  rec.set(hs, 5);
-  return rec;
-}
-
-// 落地功能性探测：TCP 连接后发送最小 TLS ClientHello（SNI=www.gstatic.com），
-// 收到任何响应字节即判定为真实转发可用——纯 TCP 连通不代表会转发数据（假可用落地会导致客户端全链路 -1）
-async function probeRelayForward(hostname, port, timeoutMs = 3000) {
-  let s;
-  try { s = await connectWithTimeout({ hostname, port }, RELAY_CONNECT_TIMEOUT); }
-  catch (e) { return false; }
-  try {
-    const writer = s.writable.getWriter();
-    await writer.write(buildClientHello('www.gstatic.com'));
-    const reader = s.readable.getReader();
-    const got = await new Promise((resolve) => {
-      const t = setTimeout(() => resolve(null), timeoutMs);
-      reader.read().then((v) => { clearTimeout(t); resolve(v && v.value && v.value.length ? v.value : null); }, () => { clearTimeout(t); resolve(null); });
-    });
-    return !!got;
-  } catch (e) { return false; }
-  finally { try { s.close(); } catch (e) {} }
-}
-
-// 打开到目标的出站连接（含多落地反代池 / 内置地区反代 / 出站代理 / 直连）
+// 打开到目标的出站连接（含内置地区反代 / 自定义反代透明代理 / 出站代理 / 直连）
 // 所有模式均为透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标
 async function openOutbound(parsed, cfg, colo, isVless) {
   const proxy = parseProxyAddress(cfg.outboundProxy);
@@ -1116,87 +1002,34 @@ async function openOutbound(parsed, cfg, colo, isVless) {
     return null;
   };
 
-  const target = { hostname: parsed.addr, port: parsed.port };
-  const allowRelay = mode !== 'no';   // outboundMode='no'：禁用反代，仅直连/出站代理
+  // 1) 优先直连目标（非 CF 网站直连可用；CF 网站回环保护会失败）
+  const directResult = await tryConnect({ hostname: parsed.addr, port: parsed.port });
+  if (directResult) return directResult;
 
-  // 1) 出站代理强制模式（outboundMode='only'）：仅走 SOCKS5/HTTP 出站，不经反代
-  if (mode === 'only') {
-    const r = await tryConnect(target);
-    if (r) return r;
-    throw lastErr || new Error('所有出站方式均失败');
+  // 2) 用户自定义 proxyIP 透明代理（优先于内置反代）
+  const relay = cfg.proxyIP ? parseHostPort(cfg.proxyIP, 443) : null;
+  if (relay && relay.host) {
+    let customTargets = await resolveProxyIPs(relay.host, relay.port);
+    if (!customTargets.length) customTargets = [{ hostname: relay.host, port: relay.port }];
+    for (const target of customTargets) {
+      const r = await tryConnect(target);
+      if (r) return r;
+    }
   }
 
-  // 2) 已配置出站代理（SOCKS5/HTTP）且未禁用：优先用户自有出口（自建落地 IP 不受流媒体限速）
-  if (viaProxy && allowRelay) {
-    const r = await tryConnect(target);
-    if (r) return r;
-  }
-
-  // 3) 多落地反代池：面板 PROXYIP 列表（多个）+ 内置地区反代兜底
-  //    并发拨号取最快可用落地，失败自动切换并记忆可用性，全部失败才继续往下
-  if (allowRelay) {
-    const relays = parseRelayList(cfg.proxyIPs && cfg.proxyIPs.length ? cfg.proxyIPs : cfg.proxyIP);
-    // 3.1) 面板配置的落地池（并行解析域名，最多取 5 条）
-    if (relays.length) {
-      const seen = new Set();
-      const cands = [];
-      const resolved = await Promise.all(relays.slice(0, 5).map(async (r) => {
-        try {
-          const list = await resolveProxyIPs(r.host, r.port);
-          return list.length ? list : [{ hostname: r.host, port: r.port }];
-        } catch (e) { return [{ hostname: r.host, port: r.port }]; }
-      }));
-      for (const list of resolved) {
-        for (const t of list) {
-          if (!t || !t.hostname) continue;
-          const k = t.hostname + ':' + t.port;
-          if (seen.has(k) || _relayRank(t.hostname, t.port) < 0) continue;
-          seen.add(k);
-          cands.push({ hostname: t.hostname, port: t.port });
-        }
-        if (cands.length >= 8) break;
-      }
-      cands.sort((a, b) => _relayRank(b.hostname, b.port) - _relayRank(a.hostname, a.port));
-      const w1 = await raceRelays(cands.slice(0, RELAY_RACE * 2));
-      if (w1) return w1.socket;
-    }
-    // 3.2) 内置地区反代（兜底）：出口为反代落地 IP 而非 CF 数据中心 IP，
-    //      避免 YouTube/Netflix 等流媒体对数据中心 IP 限速（开始快、随后被限到几百 KB/s），
-    //      同时可访问 CF CDN 网站（直连会触发 Cloudflare 回环保护）
-    if (isVless) {
-      const relayRegion = selectRelayRegion(colo);
-      const relayDomain = RELAY_DOMAINS[relayRegion];
-      if (relayDomain) {
-        const seen = new Set();
-        const cands = [];
-        try {
-          const list = await resolveProxyIPs(relayDomain, 443);
-          const base = list.length ? list : [{ hostname: relayDomain, port: 443 }];
-          for (const t of base) {
-            if (!t || !t.hostname) continue;
-            const k = t.hostname + ':' + t.port;
-            if (seen.has(k) || _relayRank(t.hostname, t.port) < 0) continue;
-            seen.add(k);
-            cands.push({ hostname: t.hostname, port: t.port });
-          }
-        } catch (e) { /* 解析失败忽略 */ }
-        cands.sort((a, b) => _relayRank(b.hostname, b.port) - _relayRank(a.hostname, a.port));
-        const w2 = await raceRelays(cands.slice(0, RELAY_RACE * 2));
-        if (w2) return w2.socket;
-      }
-    }
-    // 3.3) 出站代理组合落地：配置了出站代理时，也允许经代理拨号落地（兼容旧行为）
-    if (viaProxy && relays.length) {
-      for (const r of relays.slice(0, 3)) {
-        const s = await tryConnect({ hostname: r.host, port: r.port });
-        if (s) return s;
+  // 3) 兜底内置地区反代（透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标）
+  if (isVless) {
+    const relayRegion = selectRelayRegion(colo);
+    const relayDomain = RELAY_DOMAINS[relayRegion];
+    if (relayDomain) {
+      const relayTargets = await resolveProxyIPs(relayDomain, 443);
+      for (const target of relayTargets) {
+        const r = await tryConnect(target);
+        if (r) return r;
       }
     }
   }
 
-  // 4) 直连兜底（透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标）
-  const r = await tryConnect(target);
-  if (r) return r;
   throw lastErr || new Error('所有出站方式均失败');
 }
 
@@ -1698,13 +1531,8 @@ function buildNodes(cfg, cap = 800, skipSet = null) {
   }
   // CF CIDR 随机补足：节点数不足 fillCount（封顶 cap）时随机生成补齐（大量下发，客户端自动择优）
   // 补足节点只出 VLESS（通用协议）且固定 443，避免多协议 3 倍膨胀导致免费版 Worker CPU 超时；无明确地区，名称统一“优选IP-XXX”
-  // 速度优化：随机生成的 IP 质量无保证（实测可达率仅约 50%），仅作最后兜底——
-  // 默认模式随机补足最多占 cap 的 20%，节点主体来自域名解析 + 内置优选池（质量有保障）；
-  // 追加模式（custom + 开启追加内置及默认节点）保持大量补足（用户明确要求下发全部节点）
-  const isAppend = (mode === 'custom' && cfg.optimizer && cfg.optimizer.subIncludeDefault);
   const fillCount = Math.min(Math.max(parseInt((cfg.optimizer && cfg.optimizer.fillCount) || 0) || 0, 0), 5000);
-  const baseNeed = Math.min(fillCount, cap) - used.size;   // 按唯一 IP 数补足，而非节点数（多协议节点会膨胀 nodes.length）
-  const need = isAppend ? baseNeed : Math.max(0, Math.min(baseNeed, Math.max(0, Math.ceil(cap * 0.2))));
+  const need = Math.min(fillCount, cap) - used.size;   // 按唯一 IP 数补足，而非节点数（多协议节点会膨胀 nodes.length）
   if (need > 0) {
     // 去重下发：生成 3 倍数量后过滤已下发 IP，不足时回退包含已下发（循环使用）
     const fillPool = randomIPsFromCidrs(REACHABLE_CIDRS, need * 3);
@@ -2142,42 +1970,26 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo) {
   // 轮询机制关闭：不限制 Clash 300 / V2rayN 800 上限，一次性下发全部节点（数量由数据源与 fillCount 决定）
   if (cfg.polling === false) cap = 10000;
   // 节点数量控制：开启后按设定数量精确下发（输入多少就下发多少，上限 1000 防滥用；默认关闭不限制，不改变其它任何功能）
-  // 节点数量控制优先于轮询关闭的“全部下发”——只要开启即按设定数量截断，与轮询开关无关
-  if (cfg.nodeLimit) {
+  // 轮询机制关闭时忽略数量限制（下发全部节点）
+  if (cfg.nodeLimit && cfg.polling !== false) {
     const n = parseInt(cfg.nodeLimitCount) || 0;
     if (n > 0) cap = Math.min(n, 1000);
   }
   // 随机优选节点无地区标记，随机模式下忽略地区筛选（ipType/isp 仍生效）
   const fl = (mode === 'random') ? Object.assign({}, cfg.filter, { region: 'all' }) : cfg.filter;
   let nodes = filterNodes(buildNodes(rc, cap, skipSet), fl);
-  // 随机优选模式：随机生成的 IP 质量无保证（实测可达率仅约 50%），下发前做 Worker 端 TCP 443 探测，
-  // 剔除完全不可达的节点；极端情况下全部不可达时保留原列表兜底（保证有节点可下发）
-  if (mode === 'random' && nodes.length) {
-    const hosts = [];
-    for (const n of nodes) { try { hosts.push(parseNodeServer(n).host); } catch (e) { hosts.push(''); } }
-    const okSet = new Set(await probeReachable(hosts.filter(Boolean)));
-    const kept = nodes.filter((n, i) => !hosts[i] || okSet.has(hosts[i]));
-    if (kept.length) nodes = kept;
-  }
   // 节点数量控制：订阅模式关闭（默认）时「有多少发多少」，数据源不足不强制补足；
   // 仅自定义订阅模式按设定数量补足（该模式按地区源解析，数量不足时用优选IP补齐）
-  if (cfg.nodeLimit && mode && nodes.length < cap) {
-    // 随机补足上限：默认模式最多占 cap 的 20%（随机 IP 质量无保证，仅最后兜底）；
-    // 自定义模式保持原补足行为（用户设定数量优先，解析不足时补齐到设定值）
-    const quota = (mode === 'custom') ? (cap - nodes.length) : Math.max(0, Math.ceil(cap * 0.2));
-    const need = Math.min(cap - nodes.length, quota);
-    if (need > 0) {
-      const pool = randomIPsFromCidrs(REACHABLE_CIDRS, need * 3);
-      const freshP = skipSet ? pool.filter(ip => !skipSet.has(ip)) : pool;
-      const cands = (freshP.length >= need) ? freshP : pool;
-      // 随机生成下发前 TCP 443 探测：剔除不可达 IP，仅下发可用节点
-      const okIPs = await probeReachable(cands.slice(0, need * 2));
-      let fi = 0;
-      for (const ip of okIPs) {
-        if (nodes.length >= cap) break;
-        fi++;
-        nodes.push(vlessNode(rc, ip, 443, '优选IP-' + String(fi).padStart(3, '0')));
-      }
+  if (cfg.nodeLimit && cfg.polling !== false && mode && nodes.length < cap) {
+    const need = cap - nodes.length;
+    const pool = randomIPsFromCidrs(REACHABLE_CIDRS, need * 3);
+    const freshP = skipSet ? pool.filter(ip => !skipSet.has(ip)) : pool;
+    const fillIPs = (freshP.length >= need) ? freshP : pool;
+    let fi = 0;
+    for (const ip of fillIPs) {
+      if (nodes.length >= cap) break;
+      fi++;
+      nodes.push(vlessNode(rc, ip, 443, '优选IP-' + String(fi).padStart(3, '0')));
     }
   }
   // 严格封顶：多协议膨胀可能越过 cap 一个 IP（3 条），统一截断到上限；节点数量控制开启时同样按设定值精确截断
@@ -2270,6 +2082,8 @@ nav button.on{background:var(--acc);color:#fff;border-color:var(--acc);font-weig
 .btn{background:var(--card2);border:1px solid var(--line);color:var(--txt);padding:8px 16px;border-radius:8px;cursor:pointer;font-size:13px;transition:.15s}
 .btn:hover{border-color:var(--acc);color:var(--acc)}
 .btn.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+.btn.danger{background:var(--err);border-color:var(--err);color:#fff;font-weight:600}
+.btn.danger:hover{background:#c62828;border-color:#c62828;color:#fff}
 .btn.sm{padding:5px 10px;font-size:12px}
 .btn.dirty{outline:2px solid var(--warn)}
 .msg{padding:10px 14px;border-radius:8px;margin:10px 0;font-size:13px;display:none}
@@ -2292,7 +2106,7 @@ td .ip{font-family:ui-monospace,Consolas,monospace}
 .toast.show{transform:translateX(0)}
 .toast.ok{border-left-color:var(--ok)}
 .toast.err{border-left-color:var(--err)}
-.fbar{position:fixed;bottom:18px;right:18px;display:flex;gap:8px;z-index:50}
+.fbar{position:fixed;bottom:18px;right:18px;display:flex;flex-direction:column;gap:8px;z-index:50}
 .fbar .btn{box-shadow:0 6px 20px rgba(0,0,0,.45)}
 .loading{text-align:center;color:var(--dim);padding:40px}
 pre.code{background:#0b0e14;border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;font-size:11.5px;line-height:1.5;max-height:340px;font-family:ui-monospace,Consolas,monospace}
@@ -2501,24 +2315,15 @@ code.hl{background:var(--card2);padding:2px 6px;border-radius:5px;font-family:ui
 
   <div class="card">
     <h2>落地与出站</h2>
-    <div class="field"><label>反代/落地 IP 池（每行一个，留空使用内置地区反代；格式 host 或 host:port）</label>
-      <textarea id="f-proxyIPs" rows="4" placeholder="proxyip.hk.fxxk.dedyn.io&#10;1.2.3.4:443"></textarea>
-      <div class="hint">支持多条落地：连接时并发拨号取最快可用，失败自动切换下一个并记忆可用性，全部失败才回退直连；保存后立即生效</div>
-      <div class="row" style="margin-top:6px">
-        <button class="btn sm" onclick="fillRecommendedProxyIPs()">填入推荐落地池</button>
-        <button class="btn sm" onclick="probeProxyIPs()">检测可用性</button>
-        <button class="btn sm" onclick="clearDeadProxyIPs()">清除不可用</button>
-      </div>
-      <div class="msg" id="piMsg"></div>
-    </div>
     <div class="grid">
+      <div class="field"><label>反代/落地 IP（留空使用内置地区反代，填写后优先，格式 host 或 host:port）</label><input id="f-proxyIP" placeholder="留空使用内置中继"></div>
       <div class="field"><label>出站代理（可选，socks5:// / http:// 或 host:port）</label><input id="f-outboundProxy" placeholder="socks5://user:pass@1.2.3.4:1080"></div>
-      <div class="field"><label>出站方式</label><select id="f-outboundMode">
-        <option value="">默认（优先代理，失败直连）</option>
-        <option value="no">直连优先（no）</option>
-        <option value="only">仅走代理（only）</option>
-      </select></div>
     </div>
+    <div class="field"><label>出站方式</label><select id="f-outboundMode">
+      <option value="">默认（优先代理，失败直连）</option>
+      <option value="no">直连优先（no）</option>
+      <option value="only">仅走代理（only）</option>
+    </select></div>
   </div>
 </div>
 
@@ -2648,7 +2453,8 @@ code.hl{background:var(--card2);padding:2px 6px;border-radius:5px;font-family:ui
 </div>
 
 </div>
-<div class="fbar"><button class="btn primary" id="saveBtn" onclick="saveAll()">保存全部</button></div>
+<div class="fbar"><button class="btn danger" id="resetBtn" onclick="resetAll()">重置</button>
+<button class="btn primary" id="saveBtn" onclick="saveAll()">保存全部</button></div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -2759,10 +2565,7 @@ function fillForm(){
   $('f-enableTrojan').checked = !!CFG.enableTrojan;
   $('f-trojanPassword').value = CFG.trojanPassword || '';
   $('f-enableXhttp').checked = !!CFG.enableXhttp;
-  $('f-proxyIPs').value = (function(){
-    var pis = (CFG.proxyIPs && CFG.proxyIPs.length) ? CFG.proxyIPs : (CFG.proxyIP ? parseRelayText(CFG.proxyIP) : []);
-    return pis.map(function(x){ return x.host + (x.port && x.port !== 443 ? ':' + x.port : ''); }).join('\n');
-  })();
+  $('f-proxyIP').value = CFG.proxyIP || '';
   $('f-outboundProxy').value = CFG.outboundProxy || '';
   $('f-outboundMode').value = CFG.outboundMode || '';
   var o = CFG.optimizer || {};
@@ -2836,8 +2639,7 @@ function collectForm(){
     enableTrojan: $('f-enableTrojan').checked,
     trojanPassword: $('f-trojanPassword').value,
     enableXhttp: $('f-enableXhttp').checked,
-    proxyIPs: parseRelayText($('f-proxyIPs').value),
-    proxyIP: (function(){ var a = parseRelayText($('f-proxyIPs').value); return a.length ? (a[0].host + (a[0].port !== 443 ? ':' + a[0].port : '')) : ''; })(),
+    proxyIP: $('f-proxyIP').value.trim(),
     outboundProxy: $('f-outboundProxy').value.trim(),
     outboundMode: $('f-outboundMode').value,
     preferredDomains: (function(){
@@ -2885,6 +2687,19 @@ function saveAll(){
     .catch(function(){ toast('保存失败：无法连接服务器', 'err'); })
     .then(function(){ $('saveBtn').disabled = false; });
 }
+// 重置：清空 KV 中全部数据（面板配置 + 已下发节点记录），面板还原为最开始的部署状态
+function resetAll(){
+  if(!confirm('确定重置？将清空 KV 中全部面板配置与节点记录，面板还原为最开始的部署状态。此操作不可恢复！')) return;
+  var btn = $('resetBtn');
+  btn.disabled = true;
+  api('reset', { method: 'POST' })
+    .then(function(r){
+      if(r && r.ok){ toast(r.msg || '已重置', 'ok'); setTimeout(function(){ location.reload(); }, 900); }
+      else toast((r && r.msg) || '重置失败', 'err');
+    })
+    .catch(function(){ toast('重置失败：无法连接服务器', 'err'); })
+    .then(function(){ btn.disabled = false; });
+}
 function renderPreferred(){
   if(!CFG) return;
   var lines = [];
@@ -2894,84 +2709,6 @@ function renderPreferred(){
     lines.push((String(x.ip).indexOf(':') >= 0 ? '[' + x.ip + ']' : x.ip) + ':' + (x.port || 443) + (x.name ? ('#' + x.name) : ''));
   });
   $('f-preferred').value = lines.join('\n');
-}
-
-// ---- 落地池（多 PROXYIP） ----
-var lastProbe = null;   // 最近一次「检测可用性」结果：[{host, port, ok, latency}]
-function parseRelayText(t){
-  var out = [], seen = {};
-  String(t || '').split(/[\n,;]+/).map(function(s){ return s.trim(); }).filter(Boolean).forEach(function(s){
-    if (s.indexOf('://') >= 0) return;
-    var m;
-    if ((m = s.match(/^\[([0-9a-fA-F:]+)\](?::(\d+))?$/))) { var k = m[1] + ':' + (parseInt(m[2]) || 443); if (!seen[k]) { seen[k] = 1; out.push({ host: m[1], port: parseInt(m[2]) || 443 }); } return; }
-    var idx = s.lastIndexOf(':');
-    var host = (idx > 0 && /^\d+$/.test(s.slice(idx + 1))) ? s.slice(0, idx) : s;
-    var port = (idx > 0 && /^\d+$/.test(s.slice(idx + 1))) ? parseInt(s.slice(idx + 1)) : 443;
-    var kk = host + ':' + port;
-    if (!seen[kk]) { seen[kk] = 1; out.push({ host: host, port: port }); }
-  });
-  return out;
-}
-// 社区常用落地池（来自 edgetunnel 社区维护列表，2026-09 收集）。
-// 注意：落地由 Worker 在 CF 机房侧拨号，本地家宽无法直接验证；
-// 实际可用性由 Worker 运行期并发拨号自动判定（见 raceRelays），失效自动切换并记忆，也可用下方「检测可用性」按钮实测。
-var RECOMMENDED_PROXYIPS = [
-  'proxyip.hk.fxxk.dedyn.io', 'proxyip.jp.fxxk.dedyn.io', 'proxyip.us.fxxk.dedyn.io',
-  'proxyip.sg.fxxk.dedyn.io', 'proxyip.oracle.fxxk.dedyn.io', 'proxyip.digitalocean.fxxk.dedyn.io',
-  'proxyip.aliyun.fxxk.dedyn.io',
-  'hk.ipdb.rr.nu', 'us.ipdb.rr.nu', 'sg.ipdb.rr.nu', 'jp.ipdb.rr.nu', 'nl.ipdb.rr.nu',
-  'hk.cf.zhetengsha.eu.org', 'sg.cf.zhetengsha.eu.org', 'us.cf.zhetengsha.eu.org', 'jp.cf.zhetengsha.eu.org',
-  'my-telegram-is-herocore.onecf.eu.org', 'workers.cloudflare.cyou'
-];
-function fillRecommendedProxyIPs(){
-  $('f-proxyIPs').value = RECOMMENDED_PROXYIPS.join('\n');
-  markDirty();
-  toast('已填入推荐落地池，点击「保存全部」生效', 'ok');
-}
-function probeProxyIPs(){
-  var list = $('f-proxyIPs').value.trim();
-  if(!list){ showMsg('piMsg', '请先填写要检测的落地地址', 'err'); return; }
-  showMsg('piMsg', '正在从 Worker 检测落地可用性…', 'info');
-  api('proxyip-probe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ list: list }) })
-    .then(function(r){
-      var el = $('piMsg');
-      if(!r || !r.ok){ showMsg('piMsg', (r && r.msg) || '检测失败', 'err'); return; }
-      lastProbe = r.data || [];
-      el.className = 'msg show ok';
-      el.textContent = '';
-      (r.data || []).forEach(function(x){
-        var line = document.createElement('div');
-        line.textContent = x.host + ':' + x.port + ' → ' + (x.ok ? ('可用 ' + x.latency + 'ms') : '不可用');
-        line.style.color = x.ok ? '#3fb950' : '#f85149';
-        el.appendChild(line);
-      });
-      if(!(r.data || []).length) el.textContent = '无可检测项';
-    })
-    .catch(function(){ showMsg('piMsg', '检测失败：无法连接服务器', 'err'); });
-}
-// 从落地列表中剔除最近一次检测判定为不可用的条目（仅移除被检测过且失败的行；未检测/解析异常的行保留）
-function filterDeadProxyIPs(text, probeData){
-  var dead = {};
-  (probeData || []).forEach(function(x){ if(!x.ok) dead[x.host + ':' + x.port] = 1; });
-  var out = [];
-  String(text || '').split(/[\n,;]+/).map(function(s){ return s.trim(); }).filter(Boolean).forEach(function(s){
-    if (s.indexOf('://') >= 0) { out.push(s); return; }
-    var p = parseRelayText(s)[0];
-    if (!p) { out.push(s); return; }
-    if (dead[p.host + ':' + p.port]) return;
-    out.push(s);
-  });
-  return out;
-}
-function clearDeadProxyIPs(){
-  if (!lastProbe || !lastProbe.length) { toast('请先点击「检测可用性」再清除', 'err'); return; }
-  var before = String($('f-proxyIPs').value).split(/[\n,;]+/).map(function(s){ return s.trim(); }).filter(Boolean);
-  var after = filterDeadProxyIPs($('f-proxyIPs').value, lastProbe);
-  var removed = before.length - after.length;
-  if (!removed) { toast('没有不可用条目需要清除', 'err'); return; }
-  $('f-proxyIPs').value = after.join('\n');
-  markDirty();
-  toast('已清除 ' + removed + ' 条不可用落地，点击「保存全部」生效', 'ok');
 }
 
 // ---- 优选器 ----
@@ -3341,32 +3078,18 @@ async function handleRequest(request, env) {
       }
     }
 
-    if (apiName === 'status') {
-      return json({ ok: true, data: { version: VERSION, host: url.hostname, path: panelPath, region: (request.cf && request.cf.colo) || 'unknown' } });
-    }
-
-    if (apiName === 'proxyip-probe') {
+    if (apiName === 'reset') {
       if (request.method !== 'POST') return json({ ok: false, msg: '仅支持 POST' }, 405);
       try {
-        const body = await request.json().catch(() => ({}));
-        const relays = parseRelayList(body.list || cfg.proxyIPs);
-        const results = [];
-        const tStart = Date.now();
-        // 真实转发探测：TCP 连接 + TLS ClientHello 等待对端回包，能区分"TCP 通但不转发"的假可用落地
-        await Promise.all(relays.slice(0, 10).map(async (r) => {
-          const t0 = Date.now();
-          let ok = false;
-          try {
-            const list = await resolveProxyIPs(r.host, r.port);
-            const base = list.length ? list.slice(0, 2) : [{ hostname: r.host, port: r.port }];
-            for (const t of base) {
-              if (await probeRelayForward(t.hostname, t.port)) { ok = true; break; }
-            }
-          } catch (e) { /* 不可用 */ }
-          results.push({ host: r.host, port: r.port, ok, latency: Date.now() - t0 });
-        }));
-        return json({ ok: true, data: results, elapsed: Date.now() - tStart });
-      } catch (e) { return json({ ok: false, msg: '检测失败: ' + (e.message || e) }, 500); }
+        if (!env.K || typeof env.K.delete !== 'function') return json({ ok: false, msg: '未绑定 KV 命名空间，无需重置' }, 400);
+        await env.K.delete('config');
+        await env.K.delete('issued');
+        return json({ ok: true, msg: '已重置：KV 已清空，面板还原为初始部署状态' });
+      } catch (e) { return json({ ok: false, msg: '重置失败: ' + (e.message || e) }, 500); }
+    }
+
+    if (apiName === 'status') {
+      return json({ ok: true, data: { version: VERSION, host: url.hostname, path: panelPath, region: (request.cf && request.cf.colo) || 'unknown' } });
     }
 
     if (apiName === 'sub') {
