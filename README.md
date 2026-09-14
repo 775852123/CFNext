@@ -1,6 +1,9 @@
 # CFNext 订阅管理器
 
 > **CFNext —— 部署在 Cloudflare Workers / Pages 的代理订阅管理面板**，单文件同时实现 VLESS / Trojan / XHTTP 多协议代理与图形化配置：`/UUID`（或自定义路径）进入面板，`/sub` 输出订阅；内置节点优选器、节点数量控制、轮询下发、ECH 加密、落地与出站代理及地区 / 运营商 / IP 版本多维筛选，部署即用，绑定 KV 后改完即生效。
+>
+> **[Telegram 交流群](https://t.me/SZ_PAI)**　**[YouTube 频道](https://www.youtube.com/@PAI_CN)**
+>
 ---
 # 更新日志 _V1.0.2
 
@@ -11,8 +14,6 @@
 ## 🐛 BUG 处理
 1. **YouTube 掉速 / 节点大面积 -1** → 出站逻辑回滚至 1.0.1 版：直连目标永远最先尝试，自定义落地其次，内置地区反代最后；若仍出现掉速，将节点配置中的出站模式改为其它模式，再改回默认（优先代理，失败直连）即可
 ---
->
-> **[Telegram 交流群](https://t.me/SZ_PAI)**　**[YouTube 频道](https://www.youtube.com/@PAI_CN)**
 ## 一、项目概述与兼容性
 
 | 项 | 内容 |
