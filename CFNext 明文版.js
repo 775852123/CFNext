@@ -21,7 +21,7 @@
 //      Quantumult X / v2ray 通用链接，自动识别客户端 UA
 //    - 订阅模式：关闭（面板默认内置节点池）/ 自定义订阅（支持汇聚）/ 随机优选
 //      （官方接口），自定义订阅可开启「追加内置及默认节点」合并下发
-//    - 节点数量控制：开启后按设定数量精确下发（输入多少下发多少，默认关闭）
+//    - 节点数量控制：开启后按设定数量精确下发（默认关闭）；免费版 10ms CPU 硬限内结构化格式上限 300、行格式上限 800，超出自动钳制
 //    - 地区与筛选：按地区（HK/US/SG/JP/KR/DE 等）与 IP 类型 / 运营商过滤下发，
 //      任一维度筛选后为空时逐级放宽，保证订阅永不为空
 //    - 去重下发：客户端更新订阅时优先下发未下发过的 IP，避免重复
@@ -54,7 +54,7 @@
 // ============================================================================
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.0.2';
+const VERSION = '1.0.3';
 
 const CLASH_TEMPLATE = `pr: &pr {type: select, proxies: [♻️ 自动选择, 🚀 默认代理, 🌐 全部节点, ♻️ 香港自动, ♻️ 日本自动, ♻️ 美国自动, 🔯 香港故转, 🔯 日本故转, 🇭🇰 香港节点, 🇯🇵 日本节点, 🇺🇲 美国节点, DIRECT]}
 proxy-groups:
@@ -212,6 +212,26 @@ const REGION_CN = {
   EG: '埃及', AE: '阿联酋', IL: '以色列', NZ: '新西兰', KZ: '哈萨克斯坦', SA: '沙特'
 };
 
+// 内置 6 条地区优选源（bestcf 在线优选池，社区维护、活跃更新）：
+// 返回的是各地区的「可达中转/优选 IP」（非 CF 官方 anycast 段，但作为客户端入口可把 TLS
+// 转发到本 Worker，参考 edgetunnel / CFnew / TunnelBoard 的区域优选池用法），
+// 默认订阅模式与「追加内置及默认节点」共用
+const DEFAULT_REGION_POOLS = [
+  'https://bestcf.pages.dev/random-region/HK/100.txt',
+  'https://bestcf.pages.dev/random-region/TW/100.txt',
+  'https://bestcf.pages.dev/random-region/JP/100.txt',
+  'https://bestcf.pages.dev/random-region/SG/100.txt',
+  'https://bestcf.pages.dev/random-region/US/100.txt',
+  'https://bestcf.pages.dev/random-region/KR/100.txt'
+].join('\n');
+
+// 识别 bestcf 地区优选池 URL：这类来源的 IP 为社区中转节点（非 CF 段），
+// 允许绕过「仅 CF 段」过滤直接下发；其余来源仍保持 CF 段硬性要求
+const TRUSTED_REGION_POOL_RE = /random-region\/[A-Z]{2,}\/\d+\.txt/i;
+function isTrustedRegionPool(url) {
+  return TRUSTED_REGION_POOL_RE.test(String(url || ''));
+}
+
 const DEFAULT_CONFIG = {
   uuid: '',
   path: '',            // 自定义路径，留空用 UUID
@@ -236,7 +256,7 @@ const DEFAULT_CONFIG = {
   outboundProxy: '',
   outboundMode: '',    // '' | 'no' | 'only'
   // 优选节点（保存后随订阅下发到客户端）
-  preferredDomains: 'https://bestcf.pages.dev/random-region/HK/100.txt\nhttps://bestcf.pages.dev/random-region/TW/100.txt\nhttps://bestcf.pages.dev/random-region/JP/100.txt\nhttps://bestcf.pages.dev/random-region/SG/100.txt\nhttps://bestcf.pages.dev/random-region/US/100.txt\nhttps://bestcf.pages.dev/random-region/KR/100.txt',   // 自定义订阅模式下使用的地址（每行/逗号分隔）
+  preferredDomains: DEFAULT_REGION_POOLS,   // 自定义订阅模式下使用的地址（每行/逗号分隔）
   preferredIPs: [],       // [{ip, port, name}]
   // 优选器（在线测速参数）
   optimizer: {
@@ -744,10 +764,25 @@ function trojanPasswordHash(pass) {
 // ---------------------------------------------------------------------------
 // 出站连接：直连 / SOCKS5 / HTTP CONNECT / 反代 IP 中继
 // ---------------------------------------------------------------------------
-async function connectDirect(target) {
+async function connectDirect(target, timeoutMs) {
   const socket = connect({ hostname: target.hostname, port: target.port });
-  await socket.opened;
-  return socket;
+  // 连接超时保护：目标 SYN 被静默丢弃（CF 回环保护 / 不可达）时不再无限挂起，及时进入反代兜底
+  let timer = null;
+  const timerP = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      try { socket.close(); } catch (e) { /* 忽略 */ }
+      reject(new Error('连接超时 ' + target.hostname + ':' + target.port));
+    }, timeoutMs > 0 ? timeoutMs : 8000);
+  });
+  try {
+    await Promise.race([socket.opened, timerP]);
+    clearTimeout(timer);
+    return socket;
+  } catch (e) {
+    clearTimeout(timer);
+    try { socket.close(); } catch (e2) { /* 忽略 */ }
+    throw e;
+  }
 }
 
 // 通过 SOCKS5 代理建立到目标的连接
@@ -980,30 +1015,31 @@ async function openOutbound(parsed, cfg, colo, isVless) {
     ? (t) => connectViaHttpProxy(proxy, t)
     : (t) => connectViaSocks5(proxy, t)) : null;
 
-  const buildAttempts = (target) => {
+  const buildAttempts = (target, timeoutMs) => {
     const attempts = [];
     if (mode === 'only') {
-      attempts.push(viaProxy ? () => viaProxy(target) : () => connectDirect(target));
+      attempts.push(viaProxy ? () => viaProxy(target) : () => connectDirect(target, timeoutMs));
     } else if (mode === 'no') {
-      attempts.push(() => connectDirect(target));
+      attempts.push(() => connectDirect(target, timeoutMs));
       if (viaProxy) attempts.push(() => viaProxy(target));
     } else {
       if (viaProxy) attempts.push(() => viaProxy(target));
-      attempts.push(() => connectDirect(target));
+      attempts.push(() => connectDirect(target, timeoutMs));
     }
     return attempts;
   };
 
   let lastErr;
-  const tryConnect = async (target) => {
-    for (const fn of buildAttempts(target)) {
+  const tryConnect = async (target, timeoutMs) => {
+    for (const fn of buildAttempts(target, timeoutMs)) {
       try { return await fn(); } catch (e) { lastErr = e; }
     }
     return null;
   };
 
   // 1) 优先直连目标（非 CF 网站直连可用；CF 网站回环保护会失败）
-  const directResult = await tryConnect({ hostname: parsed.addr, port: parsed.port });
+  //    6s 连接超时：目标 SYN 被丢弃 / 直连被回环保护拦截时不再无限挂起，及时进入反代兜底
+  const directResult = await tryConnect({ hostname: parsed.addr, port: parsed.port }, 6000);
   if (directResult) return directResult;
 
   // 2) 用户自定义 proxyIP 透明代理（优先于内置反代）
@@ -1012,19 +1048,25 @@ async function openOutbound(parsed, cfg, colo, isVless) {
     let customTargets = await resolveProxyIPs(relay.host, relay.port);
     if (!customTargets.length) customTargets = [{ hostname: relay.host, port: relay.port }];
     for (const target of customTargets) {
-      const r = await tryConnect(target);
+      const r = await tryConnect(target, 6000);
       if (r) return r;
     }
   }
 
   // 3) 兜底内置地区反代（透明代理：发送去掉 VLESS 头部的原始 TLS 数据，对端按 SNI 路由到目标）
+  //    多地区轮询：本地区域优先，失败后依次尝试其余区域；单个反代失效不再导致
+  //    （尤其 CF 托管站点直连被回环保护拦截时）流量为 0
   if (isVless) {
-    const relayRegion = selectRelayRegion(colo);
-    const relayDomain = RELAY_DOMAINS[relayRegion];
-    if (relayDomain) {
-      const relayTargets = await resolveProxyIPs(relayDomain, 443);
+    const primary = selectRelayRegion(colo);
+    const regions = [primary, ...Object.keys(RELAY_DOMAINS).filter(r => r !== primary)].slice(0, 3);
+    for (const region of regions) {
+      const relayDomain = RELAY_DOMAINS[region];
+      if (!relayDomain) continue;
+      let relayTargets = [];
+      try { relayTargets = await resolveProxyIPs(relayDomain, 443); } catch (e) { /* 忽略 */ }
+      if (!relayTargets.length) continue;
       for (const target of relayTargets) {
-        const r = await tryConnect(target);
+        const r = await tryConnect(target, 5000);
         if (r) return r;
       }
     }
@@ -1085,10 +1127,11 @@ async function handleWebSocketProxy(request, cfg) {
         // 透明代理：去掉 VLESS/Trojan 头部，发送原始 TLS 数据，由对端按 SNI 路由
         // VLESS 协议：须先向客户端回 2 字节响应头（version=0 + addonsLen=0），否则客户端握手失败
         if (isVless) send(new Uint8Array([0, 0]));
-        await writer.write(pending.subarray(parsed.headerLength));
+        if (pending && pending.byteLength > parsed.headerLength) await writer.write(pending.subarray(parsed.headerLength));
+        pending = null;   // 出站就绪后清空缓冲，后续消息直接写出站
         pumpToReader(conn.readable.getReader(), send, () => { try { server.close(1000); } catch (e) { /* 忽略 */ } });
       } else {
-        if (writer) await writer.write(chunk);
+        if (writer) await writer.write(chunk); else pending = pending ? concatBytes(pending, chunk) : chunk;   // 出站未就绪时暂存，避免头部之后的早期数据帧被丢弃（否则 TLS 握手不完整 → 连接通但流量为 0）
       }
     } catch (err) {
       try { server.close(1011, String(err && err.message || err)); } catch (e) { /* 忽略 */ }
@@ -1372,6 +1415,8 @@ async function resolvePreferredDomains(domainsStr, limitPerDomain = 100, maxTota
         const seen = new Set();
         const counters = {};
         const rec = [];
+        // bestcf 地区优选池：社区维护的可达中转 IP（非 CF 段），标记后允许绕过 CF 段过滤直接下发
+        const relay = isTrustedRegionPool(d);
         for (const raw of txt.split(/\r?\n/)) {
           if (rec.length >= limitPerDomain) break;
           const m = raw.match(/(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?(?:#([^\r\n]*))?/);
@@ -1380,13 +1425,13 @@ async function resolvePreferredDomains(domainsStr, limitPerDomain = 100, maxTota
           const port = m[2] ? parseInt(m[2]) : 443;
           const key = ip + ':' + port;
           if (seen.has(key)) continue;   // 源内去重（同 IP 同端口只留一条）
-          if (filterCF && !isCloudflareIP(ip)) continue;   // 追加/默认模式强制 CF 段；仅自定义模式原样下发
+          if (filterCF && !isCloudflareIP(ip) && !relay) continue;   // 追加/默认模式强制 CF 段；bestcf 地区优选池（社区中转）放行；仅自定义模式原样下发
           seen.add(key);
           // 名称：优先匹配 "中文 地区码"（bestcf 格式 "地区随机 | 香港 HK"），再取纯中文段，再取地区码映射，否则留空走“优选IP-XX”兜底
           // 【新增】用户自定义名称（不含中文、不含 |）直接保留原样，例如 JP-A-147 / CF-B-163
           const rawName = (m[3] || '').trim();
           if (rawName && !/[\u4e00-\u9fa5]/.test(rawName) && !rawName.includes('|')) {
-            rec.push({ ip, port, name: rawName });
+            rec.push({ ip, port, name: rawName, ...(relay ? { relay: true } : {}) });
             continue;
           }
           let nm = '';
@@ -1407,8 +1452,8 @@ async function resolvePreferredDomains(domainsStr, limitPerDomain = 100, maxTota
               }
             }
           }
-          if (nm) { counters[nm] = (counters[nm] || 0) + 1; rec.push({ ip, port, name: nm + '-' + String(counters[nm]).padStart(2, '0') }); }
-          else rec.push({ ip, port, name: '' });
+          if (nm) { counters[nm] = (counters[nm] || 0) + 1; rec.push({ ip, port, name: nm + '-' + String(counters[nm]).padStart(2, '0'), ...(relay ? { relay: true } : {}) }); }
+          else rec.push({ ip, port, name: '', ...(relay ? { relay: true } : {}) });
         }
         if (!rec.length && allowRegionFallback) {
           // 追加模式兜底：源内无可解析 IP 时，按 URL 路径地区码（如 /HK/）用可达 CF 段生成该地区节点
@@ -1468,9 +1513,11 @@ function buildNodes(cfg, cap = 800, skipSet = null) {
   // 仅自定义模式（custom + 关闭追加）：严格按「优选节点」输入框内容下发，放行非 CF 段 IP（用户自担可用性）；
   // 其它模式（默认/追加/随机）入口必须是 CF 段——非 CF IP 无法转发到 Worker（历史 v2rayNG 全 -1 根因）
   const allowNonCF = (mode === 'custom' && !(cfg.optimizer && cfg.optimizer.subIncludeDefault));
-  const push = (server, port, name) => {
+  const push = (server, port, name, trusted) => {
     if (nodes.length >= cap) return;   // 生成过程限流：避免多协议膨胀超 Worker CPU
-    if (isValidIp(server) && !isCloudflareIP(server) && !allowNonCF) return;   // 入口 IP 硬性要求：非 CF 段 IP 无法转发到 Worker，直接丢弃
+    // 入口 IP 硬性要求：非 CF 段 IP 无法转发到 Worker，直接丢弃；
+    // 例外：bestcf 地区优选池的社区中转 IP（trusted 标记）可用作客户端入口，参考 edgetunnel/CFnew/TunnelBoard
+    if (isValidIp(server) && !isCloudflareIP(server) && !allowNonCF && !trusted) return;
     const key = server;   // 按服务器/IP 去重（忽略端口）：同一 IP 不同端口只保留一条
     if (used.has(key)) return;
     used.add(key);
@@ -1519,7 +1566,7 @@ function buildNodes(cfg, cap = 800, skipSet = null) {
     push(p.host, p.port, nm || '优选IP-' + String(i + 1).padStart(2, '0'));
   });
   (cfg.preferredIPs || []).forEach((x, i) => {
-    push(x.ip, x.port || 443, x.name || '优选IP-' + String(i + 1).padStart(2, '0'));
+    push(x.ip, x.port || 443, x.name || '优选IP-' + String(i + 1).padStart(2, '0'), x.relay === true);
   });
   // 自定义订阅模式：仅下发用户设置节点，不兜底内置池、不做 CF 随机补足；
   // 但开启「追加内置及默认节点」(subIncludeDefault) 后需要完整下发自定义+默认+补足，因此继续走补足逻辑
@@ -1915,17 +1962,16 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo) {
   const builtinIPs = parseIPList(BUILTIN_PREFERRED_IPS.join('\n')).map(x => ({ ip: x.ip, port: x.port || 443, name: x.name || ('优选IP-' + String(BUILTIN_PREFERRED_IPS.indexOf(x) + 1).padStart(2, '0')) }));
   if (mode === 'custom') {
     // 自定义订阅（支持汇聚）：默认仅下发「优选节点」框内设置的节点（严格模式，不生成任何额外节点）；
-    // 开启 subIncludeDefault 后追加内置优选 IP 池 + 默认 6 条地区源节点（含地区回退生成 + CF CIDR 补足），自定义与默认节点合并下发
+    // 开启 subIncludeDefault 后追加默认域名池 + 默认 6 条地区源节点（含地区回退生成 + CF CIDR 补足），自定义与默认节点合并下发
     const incDefault = !!(cfg.optimizer && cfg.optimizer.subIncludeDefault);
     // 仅自定义模式（关闭追加）：输入框内容（域名/优选API/IP）原样下发，不做 CF 段过滤（用户自担可用性）；
-    // 追加模式：CF 段过滤 + 地区回退生成，自定义与默认节点合并下发
-    resolved = await resolvePreferredDomains(cfg.preferredDomains || '', 40, 300, incDefault, incDefault, wantV6);
+    // 追加模式：常规来源 CF 段过滤（bestcf 地区优选池为社区中转节点，放行）+ 地区回退生成，自定义与默认节点合并下发
+    resolved = await resolvePreferredDomains(cfg.preferredDomains || '', 100, 600, incDefault, incDefault, wantV6);
     if (incDefault) {
-      // 默认域名池优先（CNAME 域名解析出可用 CF 优选 IP，保证可达性），自定义节点追加在后并去重
-      const def = await resolvePreferredDomains(DEFAULT_PREFERRED_DOMAINS, 40, 240, false, true, wantV6);
+      // 默认域名池补充（CNAME 域名解析出可用 CF 优选 IP，保证可达性），自定义节点追加在后并去重
+      const def = await resolvePreferredDomains(DEFAULT_PREFERRED_DOMAINS, 40, 200, false, true, wantV6);
       const seen = new Set(def.map(x => x.ip));
       resolved = [...def, ...resolved.filter(x => !seen.has(x.ip))];
-      rc.preferredIPs = [...(rc.preferredIPs || []), ...builtinIPs];
       if (!rc.optimizer) rc.optimizer = {};
       // 追加模式下按接近上限的数量补足（fillCount 决定 buildNodes 的 CF CIDR 随机补足 IP 数，默认 0 时强制大量补足），满足"下发全部节点"预期
       rc.optimizer.fillCount = Math.max(parseInt(rc.optimizer.fillCount) || 0, 800);
@@ -1934,11 +1980,16 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo) {
     // 关闭（使用面板默认）：固定使用内置 6 条地区优选源（HK/TW/JP/SG/US/KR）下发各地区节点，
     // 与「优选节点」框解耦——框内自定义源仅用于「自定义订阅（支持汇聚）」模式；
     // 在线优选「加入优选」保存的 IP（preferredIPs）仍随订阅下发，不受影响；
-    // 地区源不可达时回退内置官方优选 IP + CF CIDR 随机补足，保证开箱即用
-    resolved = await resolvePreferredDomains(DEFAULT_PREFERRED_DOMAINS, 100, 300, false, true, wantV6);
-    rc.preferredIPs = [...(rc.preferredIPs || []), ...builtinIPs];
+    // 地区源为 bestcf 在线优选池（社区维护的可达中转 IP，可用率高，参考 edgetunnel/CFnew/TunnelBoard），
+    // 不可达时按地区回退 CF CIDR 随机补足，另叠加 CNAME 域名池与内置官方优选 IP 兜底，保证开箱即用且数量充足
+    resolved = await resolvePreferredDomains(DEFAULT_REGION_POOLS, 100, 600, true, true, wantV6);
+    // CNAME 域名池补充（DNS 解析出的活跃 CF 优选 IP，与地区池去重合并）
+    const defExtra = await resolvePreferredDomains(DEFAULT_PREFERRED_DOMAINS, 40, 200, false, true, wantV6);
+    const seenExtra = new Set(resolved.map(x => x.ip));
+    resolved = [...resolved, ...defExtra.filter(x => !seenExtra.has(x.ip))];
     if (!rc.optimizer) rc.optimizer = {};
-    rc.optimizer.fillCount = Math.max(parseInt(rc.optimizer.fillCount) || 0, 30);
+    // 提高默认补足量：地区源/域名解析不足时用可达 CF 段随机补齐到上限，保证订阅数量充足
+    rc.optimizer.fillCount = Math.max(parseInt(rc.optimizer.fillCount) || 0, 1000);
   }
   // 去重下发：读取上次已下发 IP（KV issued），所有模式均生效（随机补足 / 随机优选 / 自定义解析）
   const skipSet = (cfg._skipIssued && cfg._skipIssued.size) ? cfg._skipIssued : null;
@@ -1957,23 +2008,29 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo) {
     fresh = fresh.map((x, i) => (/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}-\d+$/.test(x.name || '')) ? Object.assign({}, x, { name: '优选IP-' + String(nameBase + i + 1).padStart(2, '0') }) : x);
     rc.preferredIPs = [...(rc.preferredIPs || []), ...fresh];
   }
+  // 内置静态优选池（CF 官方段）作为最后兜底：排在动态解析/地区优选节点之后，仅作数量补位，
+  // 避免静态池占据下发名额（此前 Clash 300 上限时订阅被 300 个静态 IP 填满、动态可用节点被截断）
+  if (!(mode === 'custom' && !(cfg.optimizer && cfg.optimizer.subIncludeDefault))) {
+    rc.preferredIPs = [...(rc.preferredIPs || []), ...builtinIPs];
+  }
   ua = (ua || '').toLowerCase();
   const forced = (format || '').toLowerCase();
-  // 节点数上限（按 Workers / Pages 免费额度 10ms CPU 硬限调整）：
-  //   - 纯行格式（v2ray 通用链接）拼接近乎零成本 → 800 上限，满足大量择优；
-  //   - 结构化格式（Clash/Singbox/Surge/Loon/QuanX）模板化生成后实测 250 节点冷启动 ~5ms、300 节点 ~6ms、400 节点 ~8ms，
-  //     为保免费版稳定（含网络/KV/解析开销）收紧到 300，避免 CPU 超限导致订阅 5xx；
-  //   - 自定义订阅开启「追加内置及默认节点」时：轻量格式放宽到 800，结构化格式放宽到 300。
+  // 节点数上限（按 Workers / Pages 免费额度 10ms CPU 硬限校准；本地冷启动实测与原作者在 Workers 上的实测一致）：
+  //   - 纯行格式（v2ray 通用链接）拼接近乎零成本 → 800 上限（冷启动 ~7ms 含一次性数据源解析，缓存命中后 ~2-3ms）；
+  //   - 结构化格式（Clash/Singbox/Surge/Loon/QuanX）模板化生成实测 300 节点 ~6ms、400 节点 ~8ms，
+  //     为保免费版稳定（含网络/KV/解析/面板路由开销）收紧到 300，避免 CPU 超限导致订阅 5xx；
+  //   - 自定义订阅开启「追加内置及默认节点」时同样按格式安全上限执行；
+  //   - 节点数量控制同样按格式安全上限钳制，确保免费版 10ms 内稳定
   const isHeavy = ['clash', 'singbox', 'sing-box', 'surge', 'loon', 'quanx', 'quantumultx'].includes(forced) || /clash|singbox|sing-box|surge|loon|quantumult/.test(ua);
-  let cap = isHeavy ? 300 : 800;
-  if (mode === 'custom' && cfg.optimizer && cfg.optimizer.subIncludeDefault) cap = isHeavy ? Math.max(cap, 300) : Math.max(cap, 800);
-  // 轮询机制关闭：不限制 Clash 300 / V2rayN 800 上限，一次性下发全部节点（数量由数据源与 fillCount 决定）
+  const SAFE_CAP = isHeavy ? 300 : 800;   // 免费版 10ms CPU 安全上限（结构化 300 / 行格式 800）
+  let cap = SAFE_CAP;
+  // 轮询机制关闭：明确选择「忽略轮询与限制、下发全部节点」——数量由数据源与 fillCount 决定，可能超出免费版 10ms CPU 预算（需自行承担）
   if (cfg.polling === false) cap = 10000;
-  // 节点数量控制：开启后按设定数量精确下发（输入多少就下发多少，上限 1000 防滥用；默认关闭不限制，不改变其它任何功能）
+  // 节点数量控制：开启后按设定数量精确下发，但钳制在格式安全上限内（防免费版 CPU 超限；默认关闭不限制，不改变其它任何功能）
   // 轮询机制关闭时忽略数量限制（下发全部节点）
   if (cfg.nodeLimit && cfg.polling !== false) {
     const n = parseInt(cfg.nodeLimitCount) || 0;
-    if (n > 0) cap = Math.min(n, 1000);
+    if (n > 0) cap = Math.min(n, SAFE_CAP);
   }
   // 随机优选节点无地区标记，随机模式下忽略地区筛选（ipType/isp 仍生效）
   const fl = (mode === 'random') ? Object.assign({}, cfg.filter, { region: 'all' }) : cfg.filter;
@@ -2269,7 +2326,7 @@ code.hl{background:var(--card2);padding:2px 6px;border-radius:5px;font-family:ui
       </div>
       <div class="field" id="f-nodeLimitWrap" style="margin-bottom:0;display:none"><label>下发节点数量</label>
         <input id="f-nodeLimitCount" type="number" min="1" max="800" value="100">
-        <p class="hint">开启后最多下发该数量的节点</p>
+        <p class="hint">开启后最多下发该数量的节点；免费版 10ms CPU 硬限内，结构化格式（Clash/Singbox/Surge 等）上限 300、行格式（v2ray）上限 800，超出部分自动钳制</p>
       </div>
       <div class="field" style="margin-bottom:0"><label>轮询机制（开启后每次更新订阅下发不同节点）</label>
         <select id="f-polling" onchange="markDirty()">
