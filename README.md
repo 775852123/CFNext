@@ -50,7 +50,7 @@
 | 项 | 内容 |
 |---|---|
 | 项目名称 | **CFNext 订阅管理器** |
-| 当前版本 | v1.0.2 |
+| 当前版本 | v1.0.3 |
 | 运行环境 | Cloudflare Workers / Pages |
 | 部署形态 | 单文件 Worker/Pages（`CFNext 明文版/混淆版`） |
 | 数据存储 | Cloudflare KV（绑定变量 **K**），未绑定时配置仅存于当前会话 |
