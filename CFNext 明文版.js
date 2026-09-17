@@ -1,41 +1,6 @@
 ﻿// ============================================================================
 //  CFNext —— Cloudflare 代理管理面板 · 全新独立编写
-//  ----------------------------------------------------------------------------
-//  说明：本文件为全新实现，仅参考以下开源项目的功能清单（不复制其代码，
-//  协议层按公开规范从零实现）：
-//    - cmliu/edgetunnel ：VLESS WS/xhttp 隧道、出站代理、节点优选器思路
-//    - zizifn/edgetunnel ：多客户端订阅与优选思路
-//    - 6Kmfi6HP/EDtunnel：VLESS 隧道与 xhttp 参数约定
-//    - IonRh/Cloudflare-BestIP：在线优选思路（本面板简化为「在线优选 → 加入
-//      优选节点 → 下发客户端」，不做四云 DNS 写入）
-//
-//  核心亮点「节点优选器」：可调用微测网在线优选接口（IPv4 / IPv6 / 优选域名）、
-//  优选 IP 列表、HostMonit、内置 CF 地址段、自定义 URL 作为候选源，在线 TCP
-//  多端口测速后一键「加入优选」，保存后随订阅直接下发到客户端
-//  （Clash / Sing-box / Surge / Loon / Quantumult X / v2ray）。
-//
-//  功能一览：
-//    - 多协议代理：VLESS（WS）、Trojan（WS）、VLESS xhttp，自动识别请求类型，
-//      协议可在面板独立开关（xhttp 需勾选并绑定自定义域名）
-//    - 多客户端订阅：Clash（内置分流规则集）/ Sing-box / Surge / Loon /
-//      Quantumult X / v2ray 通用链接，自动识别客户端 UA
-//    - 订阅模式：关闭（面板默认内置节点池）/ 自定义订阅（支持汇聚）/ 随机优选
-//      （官方接口），自定义订阅可开启「追加内置及默认节点」合并下发
-//    - 节点数量控制：开启后按设定数量精确下发（默认关闭）；免费版 10ms CPU 硬限内结构化格式上限 300、行格式上限 800，超出自动钳制
-//    - 地区与筛选：按地区（HK/US/SG/JP/KR/DE 等）与 IP 类型 / 运营商过滤下发，
-//      任一维度筛选后为空时逐级放宽，保证订阅永不为空
-//    - 去重下发：客户端更新订阅时优先下发未下发过的 IP，避免重复
-//    - TLS 控制：开启仅下发 TLS 端口节点；ECH 加密与自定义 ECH 域名 / DNS
-//    - 落地与出站：内置地区反代 / 自定义反代 IP（透明代理）+ 出站代理
-//      （socks5、HTTP CONNECT），支持直连优先、仅走代理等出站方式
-//    - 在线优选 IP 去重：候选提取与测速结果均按 IP 去重，避免重复出现
-//    - 面板：管理密码登录、日间/夜间模式切换
-//    - 定时自动优选：BESTIP_AUTO=1 时按调度自动测速刷新优选节点
-//
-//  部署：把本文件内容粘贴到 Cloudflare Workers 即可。可选绑定 KV 命名空间
-//  （变量名 K，键 config 保存面板配置、issued 记录已下发 IP），不绑定亦可
-//  使用（仅配置不持久化）。
-//
+// ============================================================================
 //  环境变量：
 //    U            VLESS UUID（必填，同时用作面板访问路径，除非设置了 D）
 //    D / PATH     自定义面板路径（可选）
@@ -54,7 +19,9 @@
 // ============================================================================
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.0.3';
+const VERSION = '1.0.4';
+// GitHub 仓库最新版源码地址（面板右上角版本号按钮点击检测更新；远端版本号取自该文件 const VERSION）
+const UPDATE_RAW_URL = 'https://raw.githubusercontent.com/PAICNI/CFNext/main/CFNext%20%E6%98%8E%E6%96%87%E7%89%88.js';
 
 const CLASH_TEMPLATE = `pr: &pr {type: select, proxies: [♻️ 自动选择, 🚀 默认代理, 🌐 全部节点, ♻️ 香港自动, ♻️ 日本自动, ♻️ 美国自动, 🔯 香港故转, 🔯 日本故转, 🇭🇰 香港节点, 🇯🇵 日本节点, 🇺🇲 美国节点, DIRECT]}
 proxy-groups:
@@ -250,7 +217,7 @@ const DEFAULT_CONFIG = {
   tlsOnly: false,       // TLS 控制：关闭下发全部节点，开启仅下发 TLS 端口节点
   nodeLimit: false,     // 节点数量控制：关闭不限制下发数量（默认），开启后按 nodeLimitCount 限制节点总数
   nodeLimitCount: 100,  // 开启节点数量控制后，最多下发的节点数
-  polling: true,        // 轮询机制：开启后每次更新订阅轮询下发新节点（KV issued 去重 + 数量限制），关闭后忽略轮询与限制、下发全部节点
+  polling: true,        // 轮询机制：开启后每次更新订阅轮询下发新节点（KV issued 去重，默认上限 Clash 300/V2rayN 800）；关闭后不轮询换新、一次性下发全部节点；节点数量控制（自定义限制）与其独立、始终生效
   // 落地与出站
   proxyIP: '',
   outboundProxy: '',
@@ -1530,7 +1497,7 @@ function buildNodes(cfg, cap = 800, skipSet = null) {
   if (mode === 'random') {
     let n = Math.min(Math.max(parseInt(cfg.optimizer.subRandomCount) || 16, 1), Math.min(99, cap));
     // 节点数量控制：开启后以设定数量为准（提升随机优选生成量，使下发达到设定总数，默认关闭不影响原行为）
-    if (cfg.nodeLimit && cfg.polling !== false) {
+    if (cfg.nodeLimit) {   // 自定义数量限制与轮询开关独立：关闭轮询后仍生效
       const lim = parseInt(cfg.nodeLimitCount) || 0;
       if (lim > 0) n = Math.min(Math.max(n, lim), cap);
     }
@@ -2024,11 +1991,11 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo) {
   const isHeavy = ['clash', 'singbox', 'sing-box', 'surge', 'loon', 'quanx', 'quantumultx'].includes(forced) || /clash|singbox|sing-box|surge|loon|quantumult/.test(ua);
   const SAFE_CAP = isHeavy ? 300 : 800;   // 免费版 10ms CPU 安全上限（结构化 300 / 行格式 800）
   let cap = SAFE_CAP;
-  // 轮询机制关闭：明确选择「忽略轮询与限制、下发全部节点」——数量由数据源与 fillCount 决定，可能超出免费版 10ms CPU 预算（需自行承担）
+  // 轮询机制关闭：忽略轮询去重、一次性下发全部节点（数量由数据源与 fillCount 决定，可能超出免费版 10ms CPU 预算需自行承担）；自定义节点数量限制仍生效
   if (cfg.polling === false) cap = 10000;
-  // 节点数量控制：开启后按设定数量精确下发，但钳制在格式安全上限内（防免费版 CPU 超限；默认关闭不限制，不改变其它任何功能）
-  // 轮询机制关闭时忽略数量限制（下发全部节点）
-  if (cfg.nodeLimit && cfg.polling !== false) {
+  // 节点数量控制（自定义限制）：开启后按设定数量精确下发，但钳制在格式安全上限内（防免费版 CPU 超限；默认关闭不限制）
+  // 与轮询开关独立：轮询关闭时节点数量控制同样生效
+  if (cfg.nodeLimit) {
     const n = parseInt(cfg.nodeLimitCount) || 0;
     if (n > 0) cap = Math.min(n, SAFE_CAP);
   }
@@ -2037,7 +2004,7 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo) {
   let nodes = filterNodes(buildNodes(rc, cap, skipSet), fl);
   // 节点数量控制：订阅模式关闭（默认）时「有多少发多少」，数据源不足不强制补足；
   // 仅自定义订阅模式按设定数量补足（该模式按地区源解析，数量不足时用优选IP补齐）
-  if (cfg.nodeLimit && cfg.polling !== false && mode && nodes.length < cap) {
+  if (cfg.nodeLimit && mode && nodes.length < cap) {
     const need = cap - nodes.length;
     const pool = randomIPsFromCidrs(REACHABLE_CIDRS, need * 3);
     const freshP = skipSet ? pool.filter(ip => !skipSet.has(ip)) : pool;
@@ -2183,7 +2150,7 @@ code.hl{background:var(--card2);padding:2px 6px;border-radius:5px;font-family:ui
     <h1>CFNext</h1>
     <div class="sub">Cloudflare 代理管理面板 · 全新编写</div>
   </div>
-  <div style="margin-left:auto;font-size:12px;color:var(--dim);display:flex;align-items:center;gap:8px"><button id='themeBtn' class='btn sm' onclick='toggleTheme()' style='font-size:14px;padding:2px 8px'>🌙</button><span id="hdrInfo">加载中…</span></div>
+  <div style="margin-left:auto;font-size:12px;color:var(--dim);display:flex;align-items:center;gap:8px"><button id='themeBtn' class='btn sm' onclick='toggleTheme()' style='font-size:14px;padding:2px 8px'>🌙</button><button id="hdrInfo" class="btn sm" onclick="checkUpdate()" title="点击检测 GitHub 仓库更新" style="font-size:12px;padding:2px 8px">加载中…</button></div>
 </header>
 
 <nav id="nav">
@@ -2333,7 +2300,7 @@ code.hl{background:var(--card2);padding:2px 6px;border-radius:5px;font-family:ui
           <option value="true">开启</option>
           <option value="false">关闭</option>
         </select>
-        <p class="hint">开启：Clash节点上限：300/V2rayN节点上限：800，更新订阅覆盖原有下发节点；关闭：忽略轮询与数量限制，一次性下发全部节点</p>
+        <p class="hint">开启：每次更新订阅轮询下发新节点（默认上限 Clash 300 / V2rayN 800）；关闭：不轮询换新、一次性下发全部节点（节点数量控制不受影响，开启后仍按设定数量限制）</p>
       </div>
     </div>
   </div>
@@ -2590,6 +2557,36 @@ function loadAll(){
 function renderHeader(){
   if(!CFG) return;
   $('hdrInfo').textContent = '当前版本：' + (CFG.version || '');
+}
+// 右上角版本号按钮：点击检测 GitHub 仓库（PAICNI/CFNext）最新版本
+function checkUpdate(){
+  var btn = $('hdrInfo');
+  if(btn.getAttribute('data-checking') === '1') return;
+  btn.setAttribute('data-checking', '1');
+  var old = btn.textContent;
+  btn.textContent = '检测中…';
+  api('check-update').then(function(r){
+    btn.removeAttribute('data-checking');
+    if(!r || !r.ok){ toast((r && r.msg) || '检测失败', 'err'); btn.textContent = old; return; }
+    if(r.changed){
+      copyCode(r.code || '');
+      toast('检测到新版本，已复制代码到剪贴板', 'ok');
+      btn.textContent = '检测到新版本 ' + (r.latest || '');
+    } else {
+      toast('当前为最新版本（' + (r.current || '') + '）', 'ok');
+      btn.textContent = old;
+    }
+  }).catch(function(){
+    btn.removeAttribute('data-checking');
+    toast('检测失败', 'err');
+    btn.textContent = old;
+  });
+}
+// 复制远端最新代码到剪贴板（提示由 checkUpdate 统一给出，这里不再重复弹"已复制"）
+function copyCode(t){
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(t).then(function(){}, function(){ fallbackCopy(t); });
+  } else fallbackCopy(t);
 }
 function renderStatus(d){
   var h = '';
@@ -3147,6 +3144,20 @@ async function handleRequest(request, env) {
 
     if (apiName === 'status') {
       return json({ ok: true, data: { version: VERSION, host: url.hostname, path: panelPath, region: (request.cf && request.cf.colo) || 'unknown' } });
+    }
+
+    if (apiName === 'check-update') {
+      // 拉取 GitHub 仓库最新版源码：提取远端 VERSION 与本地对比；changed=true 时返回完整代码供前端复制
+      try {
+        const res = await fetchTimeout(UPDATE_RAW_URL, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 8000);
+        if (!res || !res.ok) return json({ ok: false, msg: '仓库拉取失败 HTTP ' + (res && res.status) }, 502);
+        const code = await res.text();
+        const m = code.match(/const\s+VERSION\s*=\s*['"]([^'"]+)['"]/);
+        const latest = m ? m[1] : '';
+        return json({ ok: true, changed: !!latest && latest !== VERSION, latest: latest, current: VERSION, code: code });
+      } catch (e) {
+        return json({ ok: false, msg: '检测失败: ' + (e.message || e) }, 500);
+      }
     }
 
     if (apiName === 'sub') {
