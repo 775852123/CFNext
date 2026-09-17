@@ -9,7 +9,7 @@
 # 更新日志 _V1.0.5
 
 ## 🐛 BUG 处理
-1. **Trojan 协议在 Mihomo/Clash Verge 中延迟失败/不可用，目前三种协议在Clash Verge均可使用，节点名称.X的为XHTTP协议**
+1. **Trojan 协议在 Mihomo/Clash Verge 中延迟失败/不可用的问题**
 2. 更换Mihomo内核下发的配置文件，新配置增加防DNS泄露；
 3. 根据现有代码，更新**特别鸣谢/调用 API 接口名单**
 
