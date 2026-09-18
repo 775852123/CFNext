@@ -18,7 +18,7 @@
 //    K            已绑定 KV 命名空间时读取图形化配置
 // ============================================================================
 import { connect } from 'cloudflare:sockets';
-const VERSION = '1.0.5';
+const VERSION = '1.0.6';
 // GitHub 仓库最新版源码地址（面板右上角版本号按钮点击检测更新；远端版本号取自该文件 const VERSION）
 const UPDATE_RAW_URL = 'https://raw.githubusercontent.com/PAICNI/CFNext/main/CFNext%20%E6%98%8E%E6%96%87%E7%89%88.js';
 const CLASH_TEMPLATE = `# ==================== 锚点配置 ====================
@@ -346,6 +346,10 @@ const REACHABLE_CIDRS = [
 const CLOUDFLARE_CIDRS_V6 = [
   '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32',
   '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32'
+];
+// IPv6 随机补足/随机优选专用段（「仅 IPv6」筛选时使用，与 IPv4 补足同一可达性原则）
+const REACHABLE_CIDRS_V6 = [
+  '2606:4700::/32', '2400:cb00::/32', '2803:f800::/32', '2a06:98c0::/29', '2c0f:f248::/32'
 ];
 // IPv6 CIDR 前缀匹配（展开为 16 进制组后按位比较）
 function ipInCidrV6(ip, cidr) {
@@ -687,9 +691,59 @@ function cidrRangeCached(cidr) {
   return r;
 }
 function randomIPFromCidr(cidr) {
+  if (String(cidr).indexOf(':') >= 0) return randomIP6FromCidr(cidr);   // IPv6 段：按前缀展开随机生成
   const [start, end] = cidrRangeCached(cidr);
   const r = start + Math.floor(Math.random() * ((end - start) >>> 0));
   return `${(r >>> 24) & 255}.${(r >>> 16) & 255}.${(r >>> 8) & 255}.${r & 255}`;
+}
+// IPv6 随机地址生成：网络前缀位固定，主机位随机（16 进制组逐位置乱，返回压缩形式）
+function randomIP6FromCidr(cidr) {
+  const [net, bitsStr] = cidr.split('/');
+  const bits = parseInt(bitsStr, 10) || 0;
+  const expand = (a) => {
+    const dbl = a.indexOf('::');
+    let groups;
+    if (dbl >= 0) {
+      const left = a.slice(0, dbl).split(':').filter(Boolean);
+      const right = a.slice(dbl + 2).split(':').filter(Boolean);
+      const fill = 8 - left.length - right.length;
+      groups = [...left, ...Array(fill).fill('0'), ...right];
+    } else groups = a.split(':');
+    return groups.map(g => g.padStart(4, '0'));
+  };
+  const g = expand(net).map(x => parseInt(x, 16));
+  let b = 0;
+  for (let i = 0; i < 8; i++) for (let k = 15; k >= 0; k--) {
+    if (b >= bits) g[i] |= (Math.random() < 0.5 ? 1 : 0) << k;   // 前缀之后的位随机化
+    b++;
+  }
+  return g.map(x => x.toString(16)).join(':');
+}
+// IPv4 → CF IPv4-embedded IPv6（2606:4700::/48 内嵌 IPv4 低 32 位，形如 2606:4700::6810:7c60 = 104.16.124.96）；
+// 实测该类地址与对应 IPv4 路由到同一 CF 边缘（Anycast 等价）、443 全可达——IPv6 模式下复用内置实测池，节点开箱即用
+function ipv4ToEmbeddedV6(ip) {
+  const p = String(ip).split('.').map(Number);
+  if (p.length !== 4 || p.some(isNaN)) return ip;
+  return '2606:4700::' + ((p[0] << 8) | p[1]).toString(16) + ':' + ((p[2] << 8) | p[3]).toString(16);
+}
+// Cloudflare 官方公开 IPv6 网段（cloudflare.com/ips-v6）：订阅生成时动态拉取，随官方公告自动同步；
+// 内存缓存 6 小时，拉取失败回退内置段（保证离线/网络异常时仍可用）
+let CF_IPS_V6_CACHE = { t: 0, cidrs: null };
+async function fetchCfIpsV6() {
+  const now = Date.now();
+  if (CF_IPS_V6_CACHE.cidrs && now - CF_IPS_V6_CACHE.t < 6 * 60 * 60 * 1000) return CF_IPS_V6_CACHE.cidrs;
+  try {
+    const res = await fetchTimeout('https://www.cloudflare.com/ips-v6', {}, 5000);
+    if (res && res.ok) {
+      const txt = await res.text();
+      const cidrs = String(txt).split(/[\s,;]+/).map(s => s.trim()).filter(s => /^[0-9a-fA-F:]+\.?\/(\d{1,3})$/.test(s) && s.includes(':'));
+      if (cidrs.length) {
+        CF_IPS_V6_CACHE = { t: now, cidrs };
+        return cidrs;
+      }
+    }
+  } catch (e) { /* 网络异常走内置回退 */ }
+  return REACHABLE_CIDRS_V6;
 }
 function randomIPsFromCidrs(cidrs, count) {
   const seen = new Set();
@@ -775,7 +829,9 @@ async function loadConfig(env) {
   // 兜底
   cfg.uuid = String(cfg.uuid || '').toLowerCase();
   if (!isUUID(cfg.uuid)) cfg.uuid = uuidv4();
-  if (!cfg.path) cfg.path = cfg.uuid;
+  // path 留空或为根路径 "/" 时回退 UUID：Worker 的 WebSocket/xhttp 代理与订阅生成统一走 panelPath 鉴权路径，
+  // 若 KV 残留 "/"（旧配置/面板填写），订阅 ws 路径与 Worker 路由不匹配会导致 CF 边缘 302/404、客户端全 -1
+  if (!cfg.path || cfg.path === '/' || cfg.path === '') cfg.path = cfg.uuid;
   if (!Array.isArray(cfg.preferredIPs)) cfg.preferredIPs = parseIPList(cfg.preferredIPs);
   return cfg;
 }
@@ -1731,6 +1787,11 @@ async function resolvePreferredDomains(domainsStr, limitPerDomain = 100, maxTota
 function buildNodes(cfg, cap = 800, skipSet = null) {
   const nodes = [];
   const used = new Set();
+  // IP 类型筛选决定随机优选/补足地址段：单选 IPv6 → CF 官方 IPv6 段（优先动态拉取的 ips-v6，回退内置）；IPv4+IPv6 同选 → IPv4 与 IPv6 段随机混用；其余 → 纯 IPv4 段
+  const ipTypes = (cfg.filter && cfg.filter.ipType) || [];
+  const v6Only = ipTypes.length === 1 && ipTypes[0] === 'IPv6';
+  const v6Cidrs = (cfg.optimizer && cfg.optimizer._v6Cidrs) || REACHABLE_CIDRS_V6;
+  const RAND_CIDRS = v6Only ? v6Cidrs : (ipTypes.includes('IPv6') ? [...REACHABLE_CIDRS, ...v6Cidrs] : REACHABLE_CIDRS);
   // 订阅模式：random 随机优选（CF CIDR 随机生成指定数量，不经域名解析）
   const mode = (cfg.optimizer && cfg.optimizer.subMode) || '';
   // 仅自定义模式（custom + 关闭追加）：严格按「优选节点」输入框内容下发，放行非 CF 段 IP（用户自担可用性）；
@@ -1761,7 +1822,7 @@ function buildNodes(cfg, cap = 800, skipSet = null) {
     const protoCount = (cfg.enableVless ? 1 : 0) + (cfg.enableTrojan ? 1 : 0) + (cfg.enableXhttp ? 1 : 0) || 1;
     let made = 0;
     // 去重下发：随机模式生成 3 倍数量后过滤已下发 IP；新 IP 排前、已下发 IP 紧随补齐，节点总量恒定
-    const randPool = randomIPsFromCidrs(REACHABLE_CIDRS, Math.ceil(n / protoCount) * 3);
+    const randPool = randomIPsFromCidrs(RAND_CIDRS, Math.ceil(n / protoCount) * 3);
     let randIPs = randPool;
     if (skipSet) {
       const unissued = randPool.filter(ip => !skipSet.has(ip));
@@ -1795,8 +1856,28 @@ function buildNodes(cfg, cap = 800, skipSet = null) {
   // 但开启「追加内置及默认节点」(subIncludeDefault) 后需要完整下发自定义+默认+补足，因此继续走补足逻辑
   if (mode === 'custom' && !(cfg.optimizer && cfg.optimizer.subIncludeDefault)) return nodes;
   if (!domains.length && !(cfg.preferredIPs || []).length) {
-    // 无任何优选：内置优选 IP 池（开箱即用）+ 官方域名兜底（无明确地区，直接使用“优选IP-XX”名称）
-    parseIPList(BUILTIN_PREFERRED_IPS.join('\n')).forEach(x => push(x.ip, x.port || 443, x.name || '0'));
+    // 无任何优选：内置优选 IP 池（开箱即用）+ 官方域名兜底（无明确地区，直接使用“优选IP-XX”名称）；
+    // 单选 IPv6：内置实测池转 IPv4-embedded IPv6（2606:4700:: 内嵌 IPv4，实测可达），不再靠随机 IPv6 补足（随机段地址路径质量不可控）；
+    // IPv4+IPv6 混合：内置池一半保持 IPv4、一半转 IPv6，实现混合下发
+    const builtinPool = parseIPList(BUILTIN_PREFERRED_IPS.join('\n'));
+    if (v6Only) {
+      builtinPool.forEach(x => push(ipv4ToEmbeddedV6(x.ip), x.port || 443, x.name || '0'));
+    } else if (ipTypes.includes('IPv6')) {
+      // IPv4+IPv6 混合：内置池一半保持 IPv4、一半转 IPv6，并【交错】推送——保证任意 cap（含节点数量控制开启时的较小 cap）下前后节点均为混合，
+      // 避免“先推完全部 IPv4 再推 IPv6”在 cap 偏小时 IPv4 占满、IPv6 一个都出不来
+      const builtinHalf = Math.ceil(builtinPool.length / 2);
+      for (let i = 0; i < builtinHalf; i++) {
+        const v4 = builtinPool[i];
+        push(v4.ip, v4.port || 443, v4.name || '0');
+        const j = i + builtinHalf;
+        if (j < builtinPool.length) {
+          const v6 = builtinPool[j];
+          push(ipv4ToEmbeddedV6(v6.ip), v6.port || 443, v6.name || '0');
+        }
+      }
+    } else {
+      builtinPool.forEach(x => push(x.ip, x.port || 443, x.name || '0'));
+    }
     BUILTIN_OFFICIAL_DOMAINS.forEach((d, i) => push(d, 443, '域名-' + String(i + 1).padStart(2, '0')));
   }
   // CF CIDR 随机补足：节点数不足 fillCount（封顶 cap）时随机生成补齐（大量下发，客户端自动择优）
@@ -1805,7 +1886,7 @@ function buildNodes(cfg, cap = 800, skipSet = null) {
   const need = Math.min(fillCount, cap) - used.size;   // 按唯一 IP 数补足，而非节点数（多协议节点会膨胀 nodes.length）
   if (need > 0) {
     // 去重下发：生成 3 倍数量后过滤已下发 IP，不足时回退包含已下发（循环使用）
-    const fillPool = randomIPsFromCidrs(REACHABLE_CIDRS, need * 3);
+    const fillPool = randomIPsFromCidrs(RAND_CIDRS, need * 3);
     const freshFill = skipSet ? fillPool.filter(ip => !skipSet.has(ip)) : fillPool;
     const fillIPs = (freshFill.length >= need) ? freshFill : fillPool;
     let fi = 0;
@@ -2014,8 +2095,24 @@ function generateClash(cfg, nodes) {
     }
     return { ...base, type: 'vless', uuid: user, network: 'ws', 'ws-opts': { path, headers: { Host: host } } };
   });
-  // 节点排序：443端口优先（非标准端口如8443在mihomo下HTTPS握手易被GFW干扰，放后面避免默认选中）
-  proxies.sort((a, b) => (a.port === 443 ? 0 : 1) - (b.port === 443 ? 0 : 1));
+  // 节点排序：443端口优先（非标准端口如8443在mihomo下HTTPS握手易被GFW干扰，放后面避免默认选中），
+  // 但【组内保持 IPv4/IPv6 交错】——纯端口排序会把非 443 的 IPv4 节点集中成尾部纯 v4 段，破坏混合模式的全局混合下发
+  const by443 = p => (p.port === 443 ? 0 : 1);
+  const g443 = [], gOther = [];
+  proxies.forEach(p => (by443(p) === 0 ? g443 : gOther).push(p));
+  const mixGroup = arr => {
+    const v4 = arr.filter(p => !String(p.server).includes(':'));
+    const v6 = arr.filter(p => String(p.server).includes(':'));
+    const out = [];
+    for (let i = 0; i < Math.max(v4.length, v6.length); i++) {
+      if (i < v4.length) out.push(v4[i]);
+      if (i < v6.length) out.push(v6[i]);
+    }
+    return out;
+  };
+  proxies.length = 0;
+  mixGroup(g443).forEach(p => proxies.push(p));
+  mixGroup(gOther).forEach(p => proxies.push(p));
   const yaml = `# CFNext 订阅
 test-url: 'http://www.gstatic.com/generate_204'
 proxies:
@@ -2158,14 +2255,26 @@ final, 🐟 漏网之鱼
 // 根据 UA 或指定格式生成订阅
 async function generateSubscription(cfg, requestUrl, format, ua, colo) {
   const rc = Object.assign({}, cfg, { host: cfg.host || new URL(requestUrl).hostname });
+  // path 兜底（与 loadConfig 一致）：空/"/" 一律回退 UUID，确保订阅 ws 路径与 Worker 面板路径匹配
+  if (!rc.path || rc.path === '/' || rc.path === '') rc.path = rc.uuid;
   const mode = (cfg.optimizer && cfg.optimizer.subMode) || '';
   // 订阅模式决定节点来源：
   //   ''（关闭，默认）→ 仅用内置默认优选池限量下发（不解析自定义订阅的优选节点）
   //   custom          → 使用「优选节点」框内地址（支持汇聚，可增删）
   //   random          → 由 buildNodes 直接随机生成，此处不解析
   let resolved = [];
-  // 仅当筛选明确「只要 IPv6」时才查询 AAAA 记录（默认 IPv4 模式直接跳过，节省 50% DNS 子请求，全局子请求控制在 15 次以内）
-  const wantV6 = !!(cfg.filter && cfg.filter.ipType && cfg.filter.ipType.length === 1 && cfg.filter.ipType[0] === 'IPv6');
+  // IP 类型筛选：单选 IPv4 → 只下发 IPv4；单选 IPv6 → 只下发 IPv6；IPv4+IPv6 同选 → 混合下发
+  // hasV6（含 IPv6，单选或混合）→ 域名源查询 AAAA；v6Only（单选 IPv6）→ 跳过 IPv4 来源（内置池/地区源）并滤掉解析出的 IPv4；
+  // 混合模式保留 IPv4 来源，补足按 IPv4+IPv6 段随机混用
+  const ipTypes = (cfg.filter && cfg.filter.ipType) || [];
+  const v6Only = ipTypes.length === 1 && ipTypes[0] === 'IPv6';
+  const hasV6 = ipTypes.includes('IPv6');
+  const wantV6 = hasV6;
+  // IPv6 相关筛选（单选/混合）或随机优选：动态拉取 CF 官方 ips-v6 段（失败回退内置），供补足/随机优选使用
+  if (wantV6 || (cfg.optimizer && cfg.optimizer.subMode === 'random')) {
+    if (!rc.optimizer) rc.optimizer = {};
+    if (!rc.optimizer._v6Cidrs) rc.optimizer._v6Cidrs = await fetchCfIpsV6();
+  }
   // 内置 Cloudflare 优选 IP（实测可达的 Anycast 兜底池，始终随订阅下发；无明确地区，名称统一“优选IP-XX”）
   const builtinIPs = parseIPList(BUILTIN_PREFERRED_IPS.join('\n')).map(x => ({ ip: x.ip, port: x.port || 443, name: x.name || ('优选IP-' + String(BUILTIN_PREFERRED_IPS.indexOf(x) + 1).padStart(2, '0')) }));
   if (mode === 'custom') {
@@ -2174,7 +2283,7 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo) {
     const incDefault = !!(cfg.optimizer && cfg.optimizer.subIncludeDefault);
     // 仅自定义模式（关闭追加）：输入框内容（域名/优选API/IP）原样下发，不做 CF 段过滤（用户自担可用性）；
     // 追加模式：常规来源 CF 段过滤（bestcf 地区优选池为社区中转节点，放行）+ 地区回退生成，自定义与默认节点合并下发
-    resolved = await resolvePreferredDomains(cfg.preferredDomains || '', 100, 600, incDefault, incDefault, wantV6);
+    resolved = v6Only ? [] : await resolvePreferredDomains(cfg.preferredDomains || '', 100, 600, incDefault, incDefault, wantV6);
     if (incDefault) {
       // 默认域名池补充（CNAME 域名解析出可用 CF 优选 IP，保证可达性），自定义节点追加在后并去重
       const def = await resolvePreferredDomains(DEFAULT_PREFERRED_DOMAINS, 40, 200, false, true, wantV6);
@@ -2189,8 +2298,9 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo) {
     // 与「优选节点」框解耦——框内自定义源仅用于「自定义订阅（支持汇聚）」模式；
     // 在线优选「加入优选」保存的 IP（preferredIPs）仍随订阅下发，不受影响；
     // 地区源为 bestcf 在线优选池（社区维护的可达中转 IP，可用率高，参考 edgetunnel/CFnew/TunnelBoard），
-    // 不可达时按地区回退 CF CIDR 随机补足，另叠加 CNAME 域名池与内置官方优选 IP 兜底，保证开箱即用且数量充足
-    resolved = await resolvePreferredDomains(DEFAULT_REGION_POOLS, 100, 600, true, true, wantV6);
+    // 不可达时按地区回退 CF CIDR 随机补足，另叠加 CNAME 域名池与内置官方优选 IP 兜底，保证开箱即用且数量充足；
+    // 「仅 IPv6」筛选时跳过地区源（bestcf 为纯 IPv4 文本、不产 IPv6，占满 cap 会让 IPv6 补足无位置），只靠域名 AAAA + IPv6 CIDR 补足
+    resolved = v6Only ? [] : await resolvePreferredDomains(DEFAULT_REGION_POOLS, 100, 600, true, true, wantV6);
     // CNAME 域名池补充（DNS 解析出的活跃 CF 优选 IP，与地区池去重合并）
     const defExtra = await resolvePreferredDomains(DEFAULT_PREFERRED_DOMAINS, 40, 200, false, true, wantV6);
     const seenExtra = new Set(resolved.map(x => x.ip));
@@ -2216,10 +2326,52 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo) {
     fresh = fresh.map((x, i) => (/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}-\d+$/.test(x.name || '')) ? Object.assign({}, x, { name: '优选IP-' + String(nameBase + i + 1).padStart(2, '0') }) : x);
     rc.preferredIPs = [...(rc.preferredIPs || []), ...fresh];
   }
+  // 「仅 IPv6」筛选：清掉各来源混入的 IPv4（域名解析 AAAA、用户自定义 IPv6 保留；IPv4 会被 filterNodes 滤掉并占满 cap）；
+  // 混合模式（IPv4+IPv6 同选）不做过滤，保留 IPv4 来源实现混合下发
+  if (v6Only && rc.preferredIPs) rc.preferredIPs = rc.preferredIPs.filter(x => String(x.ip).indexOf(':') >= 0);
   // 内置静态优选池（CF 官方段）作为最后兜底：排在动态解析/地区优选节点之后，仅作数量补位，
-  // 避免静态池占据下发名额（此前 Clash 300 上限时订阅被 300 个静态 IP 填满、动态可用节点被截断）
+  // 避免静态池占据下发名额（此前 Clash 300 上限时订阅被 300 个静态 IP 填满、动态可用节点被截断）；
+  // 单选 IPv6：内置实测池转 IPv4-embedded IPv6（实测可达，替代随机 IPv6 补足——随机段地址路径质量不可控）；
+  // IPv4+IPv6 混合：一半保持 IPv4、一半转 IPv6，实现混合下发
   if (!(mode === 'custom' && !(cfg.optimizer && cfg.optimizer.subIncludeDefault))) {
-    rc.preferredIPs = [...(rc.preferredIPs || []), ...builtinIPs];
+    let builtinPush = builtinIPs;
+    if (v6Only) {
+      builtinPush = builtinIPs.map(x => Object.assign({}, x, { ip: ipv4ToEmbeddedV6(x.ip) }));
+    } else if (hasV6) {
+      // 交错：IPv4 / IPv6 交替排列，避免 buildNodes 按序 push 时 IPv4 先占满 cap（节点数量控制开启时混合失效的根因）
+      const builtinHalf = Math.ceil(builtinIPs.length / 2);
+      builtinPush = [];
+      for (let i = 0; i < builtinHalf; i++) {
+        builtinPush.push(builtinIPs[i]);
+        const j = i + builtinHalf;
+        if (j < builtinIPs.length) builtinPush.push(Object.assign({}, builtinIPs[j], { ip: ipv4ToEmbeddedV6(builtinIPs[j].ip) }));
+      }
+    }
+    // 混合模式（IPv4+IPv6 同选）：全局 1:1 交错下发——所有来源（地区源/自定义优选/域名解析/内置池）先分 IPv4 与 IPv6 两组，
+    // 再把【每个 IPv4 节点映射为同一 CF 边缘的 IPv4-embedded IPv6】加入 v6 池（实测可达，替代随机官方 V6 段——路径质量不可控），
+    // v6 池与 v4 池等量后逐对交错合并：整份订阅任意前缀均为混合、任意 cap 下等比例（cap 截断天然 1:1），
+    // 解决此前“v6 池偏小先耗尽、后面大片纯 IPv4”的问题；
+    // 自定义订阅-关闭追加（仅自定义节点）除外：完全按用户填写原样下发，不强制混合
+    if (hasV6 && !v6Only) {
+      const all = [...(rc.preferredIPs || []), ...builtinPush];
+      const v4 = all.filter(x => String(x.ip).indexOf(':') < 0);
+      const v6 = all.filter(x => String(x.ip).indexOf(':') >= 0);
+      // v6full = 内置 v6 与「v4→embedded IPv6」交错排列（embedded 保留原端口）：任何 cap 截断下 v6 池都同时含 443 与 8443 等各端口，
+      // 避免“内置 v6 全 443 先占满 cap、embedded(8443) 进不来”导致 Clash 端口分组后尾部纯 IPv4
+      const v6full = [];
+      for (let i = 0; i < Math.max(v6.length, v4.length); i++) {
+        if (i < v6.length) v6full.push(v6[i]);
+        if (i < v4.length) v6full.push(Object.assign({}, v4[i], { ip: ipv4ToEmbeddedV6(v4[i].ip) }));
+      }
+      const merged = [];
+      for (let i = 0; i < Math.max(v4.length, v6full.length); i++) {
+        if (i < v4.length) merged.push(v4[i]);
+        if (i < v6full.length) merged.push(v6full[i]);
+      }
+      rc.preferredIPs = merged;
+    } else {
+      rc.preferredIPs = [...(rc.preferredIPs || []), ...builtinPush];
+    }
   }
   ua = (ua || '').toLowerCase();
   const forced = (format || '').toLowerCase();
@@ -2247,7 +2399,10 @@ async function generateSubscription(cfg, requestUrl, format, ua, colo) {
   // 仅自定义订阅模式按设定数量补足（该模式按地区源解析，数量不足时用优选IP补齐）
   if (cfg.nodeLimit && mode && nodes.length < cap) {
     const need = cap - nodes.length;
-    const pool = randomIPsFromCidrs(REACHABLE_CIDRS, need * 3);
+    // 补足段与 IP 类型筛选联动：单选 IPv6 用官方 V6 段、混合用 IPv4+V6 段（避免数量控制下补足清一色 IPv4）、默认 IPv4 段
+    const v6c = (rc.optimizer && rc.optimizer._v6Cidrs) || REACHABLE_CIDRS_V6;
+    const fillCidrs = v6Only ? v6c : (hasV6 ? [...REACHABLE_CIDRS, ...v6c] : REACHABLE_CIDRS);
+    const pool = randomIPsFromCidrs(fillCidrs, need * 3);
     const freshP = skipSet ? pool.filter(ip => !skipSet.has(ip)) : pool;
     const fillIPs = (freshP.length >= need) ? freshP : pool;
     let fi = 0;
