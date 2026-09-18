@@ -12,12 +12,12 @@
 
 **1. 筛选设置勾选「IPv6」但实际只下发 IPv4 节点；IPv4+IPv6 同选不能混合下发；IPv6 节点全部 -1 不可用**
 
-- **筛选不生效**：
+## 筛选不生效：
 - CF CIDR 随机补足/随机优选一直用全 IPv4 段（`REACHABLE_CIDRS`），数据源不产 IPv6；
 - 内置静态优选池（300 条全 IPv4）先占满 ，IPv6 补足无位置；
 - bestcf 地区源为纯 IPv4 文本且解析结果先占满。三者叠加导致 IPv6 筛选后节点池为空 → 触发 `filterNodes` 逐级放宽（放宽 ipType）→ 回退全部 IPv4。
 
-- **修复**：
+## 修复：
 - 新增 `REACHABLE_CIDRS_V6` 段池供补足与随机优选；
 - `randomIPFromCidr` 识别 IPv6 段走新增 `randomIP6FromCidr`；
 - IP 类型筛选语义拆分为三段：**单选 IPv4 → 只下发 IPv4**、**单选 IPv6 → 只下发 IPv6**、**IPv4+IPv6 同选 → 混合下发**；
