@@ -6,6 +6,25 @@
 
 
 ---
+# 更新日志 _V1.0.6
+
+## 🐛 BUG 处理
+
+**1. 筛选设置勾选「IPv6」但实际只下发 IPv4 节点；IPv4+IPv6 同选不能混合下发；IPv6 节点全部 -1 不可用**
+
+- **筛选不生效**：
+①CF CIDR 随机补足/随机优选一直用全 IPv4 段（`REACHABLE_CIDRS`），数据源不产 IPv6；
+②内置静态优选池（300 条全 IPv4）先占满 ，IPv6 补足无位置；
+③bestcf 地区源为纯 IPv4 文本且解析结果先占满。三者叠加导致 IPv6 筛选后节点池为空 → 触发 `filterNodes` 逐级放宽（放宽 ipType）→ 回退全部 IPv4。
+
+- **修复**：
+①新增 `REACHABLE_CIDRS_V6` 段池供补足与随机优选；
+②`randomIPFromCidr` 识别 IPv6 段走新增 `randomIP6FromCidr`；
+③IP 类型筛选语义拆分为三段：**单选 IPv4 → 只下发 IPv4**、**单选 IPv6 → 只下发 IPv6**、**IPv4+IPv6 同选 → 混合下发**；
+④新增 `ipv4ToEmbeddedV6`——内置实测池 300 条 IPv4 转 CF IPv4-embedded IPv6（`2606:4700::<hex>`，实测 6/6 TCP 可达、与对应 IPv4 路由到同一 CF 边缘），单选 IPv6 时内置池全量转 embedded IPv6 替代随机补足、混合时一半保持 IPv4 一半转 IPv6，实现"下发即用"；
+⑤新增 `fetchCfIpsV6`：IPv6 相关筛选/随机优选时动态拉取 **Cloudflare 官方 `cloudflare.com/ips-v6` 公开网段**（7 个官方 CIDR，随公告自动同步），内存缓存 6 小时，拉取失败自动回退内置段，补足与随机优选优先使用官方段（含内置缺失的 2405:b500::/32、2405:8100::/32）。
+
+---
 # 更新日志 _V1.0.5
 
 ## 🐛 BUG 处理
